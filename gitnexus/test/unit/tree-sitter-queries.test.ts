@@ -56,6 +56,10 @@ describe('tree-sitter queries', () => {
       expect(TYPESCRIPT_QUERIES).toContain('@definition.function');
     });
 
+    it('captures generator function declarations', () => {
+      expect(TYPESCRIPT_QUERIES).toContain('generator_function_declaration');
+    });
+
     it('captures method definitions', () => {
       expect(TYPESCRIPT_QUERIES).toContain('method_definition');
       expect(TYPESCRIPT_QUERIES).toContain('@definition.method');
@@ -86,6 +90,10 @@ describe('tree-sitter queries', () => {
       expect(JAVASCRIPT_QUERIES).toContain('@definition.class');
       expect(JAVASCRIPT_QUERIES).toContain('@definition.function');
       expect(JAVASCRIPT_QUERIES).toContain('@definition.method');
+    });
+
+    it('captures generator function declarations', () => {
+      expect(JAVASCRIPT_QUERIES).toContain('generator_function_declaration');
     });
 
     it('captures heritage (extends)', () => {

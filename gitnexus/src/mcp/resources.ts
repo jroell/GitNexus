@@ -186,10 +186,12 @@ async function getReposResource(backend: LocalBackend): Promise<string> {
  * Context resource — codebase overview for a specific repo
  */
 async function getContextResource(backend: LocalBackend, repoName?: string): Promise<string> {
+  // Refresh repo metadata/context cache so resource reads reflect recent analyze runs.
+  await backend.listRepos();
+
   // Resolve repo
   const repo = await backend.resolveRepo(repoName);
-  const repoId = repo.name.toLowerCase();
-  const context = backend.getContext(repoId) || backend.getContext();
+  const context = backend.getContext(repo.id);
 
   if (!context) {
     return 'error: No codebase loaded. Run: gitnexus analyze';

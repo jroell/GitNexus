@@ -21,6 +21,7 @@ function createMockBackend(overrides: Partial<Record<string, any>> = {}): any {
   return {
     listRepos: vi.fn().mockResolvedValue(overrides.repos ?? []),
     resolveRepo: vi.fn().mockResolvedValue(overrides.resolvedRepo ?? {
+      id: 'test-repo-id',
       name: 'test-repo',
       repoPath: '/tmp/test-repo',
       lastCommit: 'abc1234',
@@ -132,15 +133,26 @@ describe('readResource', () => {
   });
 
   it('routes gitnexus://repo/{name}/context correctly', async () => {
+    const context = {
+      projectName: 'test-project',
+      stats: { fileCount: 10, functionCount: 50, communityCount: 3, processCount: 5 },
+    };
     const backend = createMockBackend({
-      context: {
-        projectName: 'test-project',
-        stats: { fileCount: 10, functionCount: 50, communityCount: 3, processCount: 5 },
+      resolvedRepo: {
+        id: 'test-project-ctx',
+        name: 'test-project',
+        repoPath: '/tmp/test-project',
+        lastCommit: 'abc1234',
       },
+      getContext: vi.fn().mockImplementation((repoId?: string) =>
+        repoId === 'test-project-ctx' ? context : null
+      ),
     });
 
     const result = await readResource('gitnexus://repo/test-project/context', backend);
+    expect(backend.listRepos).toHaveBeenCalled();
     expect(backend.resolveRepo).toHaveBeenCalledWith('test-project');
+    expect(backend.getContext).toHaveBeenCalledWith('test-project-ctx');
     expect(result).toContain('test-project');
     expect(result).toContain('files: 10');
   });

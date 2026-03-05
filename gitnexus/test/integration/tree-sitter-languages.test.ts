@@ -52,6 +52,18 @@ describe('Tree-sitter multi-language parsing', () => {
       expect(defTypes).toContain('definition.class');
       expect(defTypes).toContain('definition.function');
     });
+
+    it('captures exported async generator functions', async () => {
+      await loadLanguage(SupportedLanguages.TypeScript, 'snippet.ts');
+      const content = 'export async function* streamAgentResponse() {}';
+      const { matches } = parseAndQuery(parser, content, LANGUAGE_QUERIES[SupportedLanguages.TypeScript]);
+      const defs = extractDefinitions(matches);
+
+      expect(defs).toContainEqual({
+        type: 'definition.function',
+        name: 'streamAgentResponse',
+      });
+    });
   });
 
   describe('TSX', () => {
@@ -79,6 +91,18 @@ describe('Tree-sitter multi-language parsing', () => {
       const names = defs.map(d => d.name);
       expect(names).toContain('EventEmitter');
       expect(names).toContain('createLogger');
+    });
+
+    it('captures exported async generator functions', async () => {
+      await loadLanguage(SupportedLanguages.JavaScript);
+      const content = 'export async function* streamAgentResponse() {}';
+      const { matches } = parseAndQuery(parser, content, LANGUAGE_QUERIES[SupportedLanguages.JavaScript]);
+      const defs = extractDefinitions(matches);
+
+      expect(defs).toContainEqual({
+        type: 'definition.function',
+        name: 'streamAgentResponse',
+      });
     });
   });
 

@@ -97,6 +97,10 @@ interface RepoHandle {
   stats?: RegistryEntry['stats'];
 }
 
+function formatRepoChoices(handles: RepoHandle[]): string {
+  return handles.map(handle => `${handle.name} (${handle.repoPath})`).join(', ');
+}
+
 export class LocalBackend {
   private repos: Map<string, RepoHandle> = new Map();
   private contextCache: Map<string, CodebaseContext> = new Map();
@@ -225,20 +229,34 @@ export class LocalBackend {
 
     if (repoParam) {
       const paramLower = repoParam.toLowerCase();
-      // Match by id
-      if (this.repos.has(paramLower)) return this.repos.get(paramLower)!;
-      // Match by name (case-insensitive)
-      for (const handle of this.repos.values()) {
-        if (handle.name.toLowerCase() === paramLower) return handle;
-      }
-      // Match by path (substring)
+      // Match by path (exact)
       const resolved = path.resolve(repoParam);
       for (const handle of this.repos.values()) {
         if (handle.repoPath === resolved) return handle;
       }
+
+      // Match by name (case-insensitive)
+      const exactNameMatches = [...this.repos.values()]
+        .filter(handle => handle.name.toLowerCase() === paramLower);
+      if (exactNameMatches.length === 1) return exactNameMatches[0];
+      if (exactNameMatches.length > 1) {
+        throw new Error(
+          `Repository name "${repoParam}" is ambiguous. Use the full repo path or repo id. Matches: ${formatRepoChoices(exactNameMatches)}`
+        );
+      }
+
+      // Match by id after name disambiguation so duplicate repo names don't silently
+      // resolve to the repo whose generated id happens to equal the short name.
+      if (this.repos.has(paramLower)) return this.repos.get(paramLower)!;
+
       // Match by partial name
-      for (const handle of this.repos.values()) {
-        if (handle.name.toLowerCase().includes(paramLower)) return handle;
+      const partialMatches = [...this.repos.values()]
+        .filter(handle => handle.name.toLowerCase().includes(paramLower));
+      if (partialMatches.length === 1) return partialMatches[0];
+      if (partialMatches.length > 1) {
+        throw new Error(
+          `Repository "${repoParam}" is ambiguous. Use the full repo path or repo id. Matches: ${formatRepoChoices(partialMatches)}`
+        );
       }
       return null;
     }

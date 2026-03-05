@@ -19,6 +19,9 @@ export const TYPESCRIPT_QUERIES = `
 (function_declaration
   name: (identifier) @name) @definition.function
 
+(generator_function_declaration
+  name: (identifier) @name) @definition.function
+
 (method_definition
   name: (property_identifier) @name) @definition.method
 
@@ -43,6 +46,10 @@ export const TYPESCRIPT_QUERIES = `
     (variable_declarator
       name: (identifier) @name
       value: (function_expression)))) @definition.function
+
+(export_statement
+  declaration: (generator_function_declaration
+    name: (identifier) @name)) @definition.function
 
 (import_statement
   source: (string) @import.source) @import
@@ -77,6 +84,9 @@ export const JAVASCRIPT_QUERIES = `
 (function_declaration
   name: (identifier) @name) @definition.function
 
+(generator_function_declaration
+  name: (identifier) @name) @definition.function
+
 (method_definition
   name: (property_identifier) @name) @definition.method
 
@@ -101,6 +111,10 @@ export const JAVASCRIPT_QUERIES = `
     (variable_declarator
       name: (identifier) @name
       value: (function_expression)))) @definition.function
+
+(export_statement
+  declaration: (generator_function_declaration
+    name: (identifier) @name)) @definition.function
 
 (import_statement
   source: (string) @import.source) @import

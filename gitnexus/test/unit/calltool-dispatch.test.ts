@@ -64,6 +64,17 @@ function setupMultipleRepos() {
   ]);
 }
 
+function setupDuplicateRepoNames() {
+  (listRegisteredRepos as any).mockResolvedValue([
+    MOCK_REPO_ENTRY,
+    {
+      ...MOCK_REPO_ENTRY,
+      path: '/tmp/test-project-copy',
+      storagePath: '/tmp/.gitnexus/test-project-copy',
+    },
+  ]);
+}
+
 function setupNoRepos() {
   (listRegisteredRepos as any).mockResolvedValue([]);
 }
@@ -306,6 +317,26 @@ describe('LocalBackend.resolveRepo', () => {
     const result = await backend.callTool('query', {
       query: 'auth',
       repo: 'test-project',
+    });
+    expect(result).toHaveProperty('processes');
+  });
+
+  it('throws when duplicate repo names make a repo param ambiguous', async () => {
+    setupDuplicateRepoNames();
+    await backend.init();
+    await expect(backend.callTool('query', {
+      query: 'auth',
+      repo: 'test-project',
+    })).rejects.toThrow('ambiguous');
+  });
+
+  it('resolves duplicate repo names by full path', async () => {
+    setupDuplicateRepoNames();
+    await backend.init();
+    (executeParameterized as any).mockResolvedValue([]);
+    const result = await backend.callTool('query', {
+      query: 'auth',
+      repo: '/tmp/test-project-copy',
     });
     expect(result).toHaveProperty('processes');
   });
