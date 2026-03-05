@@ -78,5 +78,5 @@ Lists all repositories registered in `~/.gitnexus/registry.json`. The MCP `list_
 ## Troubleshooting
 
 - **"Not inside a git repository"**: Run from a directory inside a git repo
-- **Index is stale after re-analyzing**: Restart Claude Code to reload the MCP server
+- **`gitnexus://repo/{name}/context` still looks stale after `analyze`**: Cross-check `list_repos`; the resource view can lag even when tool calls are fresh. Restart Claude Code if needed.
 - **Embeddings slow**: Omit `--embeddings` (it's off by default) or set `OPENAI_API_KEY` for faster API-based embedding

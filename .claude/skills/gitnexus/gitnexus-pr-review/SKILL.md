@@ -161,3 +161,9 @@ Structure your review as:
 ### Recommendation
 APPROVE / REQUEST CHANGES / NEEDS DISCUSSION
 ```
+
+## Reality Checks
+
+- `detect_changes({scope: "compare"})` is best for hotspot discovery, not as the only review artifact.
+- On large PRs, `detect_changes` can return a lot of symbols and processes; use it to choose which symbols deserve `impact`/`context`, then read the diff manually.
+- `impact` and `context` are most reliable on a handful of important indexed symbols, not every trivial edit in the PR.

@@ -95,3 +95,9 @@ gitnexus_detect_changes({scope: "staged"})
 
 3. Risk: 2 direct callers, 2 processes = MEDIUM
 ```
+
+## Reality Checks
+
+- `impact` works best on unique indexed symbols. If the target is still `not found` after a fresh analyze, switch to `rg` and file reads.
+- `detect_changes` is useful for code diffs, but docs-only/config-only changes and very large branch diffs can produce noisy output.
+- Dynamic references, string-based dispatch, and reflection still need manual review even when `impact` looks clean.

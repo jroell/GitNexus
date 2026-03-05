@@ -30,7 +30,7 @@ description: "Use when the user wants to rename, extract, split, move, or restru
 
 ```
 - [ ] gitnexus_rename({symbol_name: "oldName", new_name: "newName", dry_run: true}) — preview all edits
-- [ ] Review graph edits (high confidence) and ast_search edits (review carefully)
+- [ ] Review graph edits (high confidence) and text_search edits (review carefully)
 - [ ] If satisfied: gitnexus_rename({..., dry_run: false}) — apply edits
 - [ ] gitnexus_detect_changes() — verify only expected files changed
 - [ ] Run tests for affected processes
@@ -119,3 +119,10 @@ RETURN caller.name, caller.filePath ORDER BY caller.filePath
    → Affected: LoginFlow, TokenRefresh
    → Risk: MEDIUM — run tests for these flows
 ```
+
+## Reality Checks
+
+- `rename` works well for unique indexed symbols and confidence-tagged previews.
+- Review every `text_search` edit manually; those are less reliable than graph edits.
+- If `rename` says `not found` after a fresh analyze, the symbol may be unindexed or parser-missed. Fall back to `rg`/manual refactoring.
+- Do not rely on GitNexus rename for dynamic strings, config keys, serialized names, or reflection-heavy code.

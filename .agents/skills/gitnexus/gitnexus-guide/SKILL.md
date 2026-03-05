@@ -53,6 +53,22 @@ Lightweight reads (~100-500 tokens) for navigation:
 | `gitnexus://repo/{name}/process/{processName}` | Step-by-step trace                        |
 | `gitnexus://repo/{name}/schema`                | Graph schema for Cypher                   |
 
+## Fast Decision Rules
+
+- Use `query` for concept-level discovery such as features, flows, UI text, or subsystem names.
+- Use `context`, `impact`, or `rename` directly when you already know the unique symbol name.
+- Use `detect_changes` for staged/compare code diffs, then inspect the actual patch with `git diff`.
+- Use `cypher` only for targeted graph questions after reading the schema.
+- Switch to `rg` + source reads when GitNexus says `not found`, returns only generic definitions, or you need an exact string match.
+
+## Observed Limits
+
+- `query` is weak for exact symbol-name lookup and literal runtime/library error strings.
+- Some syntax forms can be missed by the index even after `analyze` (observed on `export async function*` in this repo).
+- `gitnexus://repo/{name}/context` can lag after `npx gitnexus analyze`; cross-check with `list_repos` if the resource still looks stale.
+- Process and cluster labels are heuristic summaries, not canonical architecture.
+- `cypher` is powerful but brittle; keep queries simple and validate against schema.
+
 ## Graph Schema
 
 **Nodes:** File, Function, Class, Interface, Method, Community, Process

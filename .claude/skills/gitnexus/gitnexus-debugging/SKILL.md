@@ -16,10 +16,11 @@ description: "Use when the user is debugging a bug, tracing an error, or asking 
 ## Workflow
 
 ```
-1. gitnexus_query({query: "<error or symptom>"})            → Find related execution flows
-2. gitnexus_context({name: "<suspect>"})                    → See callers/callees/processes
-3. READ gitnexus://repo/{name}/process/{name}                → Trace execution flow
-4. gitnexus_cypher({query: "MATCH path..."})                 → Custom traces if needed
+1. rg "<exact error text / log line>"                        → Find literal matches first
+2. gitnexus_query({query: "<subsystem or behavior>"})        → Find related execution flows
+3. gitnexus_context({name: "<suspect>"})                     → See callers/callees/processes
+4. READ gitnexus://repo/{name}/process/{name}               → Trace execution flow
+5. gitnexus_cypher({query: "MATCH path..."})                → Custom traces if needed
 ```
 
 > If "Index is stale" → run `npx gitnexus analyze` in terminal.
@@ -28,7 +29,8 @@ description: "Use when the user is debugging a bug, tracing an error, or asking 
 
 ```
 - [ ] Understand the symptom (error message, unexpected behavior)
-- [ ] gitnexus_query for error text or related code
+- [ ] `rg` exact error text / log text first
+- [ ] gitnexus_query for subsystem, behavior, or related code
 - [ ] Identify the suspect function from returned processes
 - [ ] gitnexus_context to see callers and callees
 - [ ] Trace execution flow via process resource if applicable
@@ -40,7 +42,7 @@ description: "Use when the user is debugging a bug, tracing an error, or asking 
 
 | Symptom              | GitNexus Approach                                          |
 | -------------------- | ---------------------------------------------------------- |
-| Error message        | `gitnexus_query` for error text → `context` on throw sites |
+| Error message        | `rg` exact text first → `gitnexus_query` for subsystem → `context` on throw sites |
 | Wrong return value   | `context` on the function → trace callees for data flow    |
 | Intermittent failure | `context` → look for external calls, async deps            |
 | Performance issue    | `context` → find symbols with many callers (hot paths)     |
@@ -87,3 +89,9 @@ RETURN [n IN nodes(path) | n.name] AS chain
 
 4. Root cause: fetchRates calls external API without proper timeout
 ```
+
+## Reality Checks
+
+- `query` is weak for literal library/runtime messages; use `rg` for exact strings.
+- Use `context` once you have a real suspect symbol; it is stronger than repeatedly refining `query`.
+- If GitNexus says `not found` after a fresh analyze, assume an index gap and continue with source search.

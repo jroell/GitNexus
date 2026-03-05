@@ -18,8 +18,8 @@ description: "Use when the user asks how code works, wants to understand archite
 ```
 1. READ gitnexus://repos                          → Discover indexed repos
 2. READ gitnexus://repo/{name}/context             → Codebase overview, check staleness
-3. gitnexus_query({query: "<what you want to understand>"})  → Find related execution flows
-4. gitnexus_context({name: "<symbol>"})            → Deep dive on specific symbol
+3. gitnexus_query({query: "<concept / subsystem / UI wording>"})  → Find related execution flows
+4. gitnexus_context({name: "<known symbol>"})      → Deep dive on specific symbol
 5. READ gitnexus://repo/{name}/process/{name}      → Trace full execution flow
 ```
 
@@ -34,6 +34,7 @@ description: "Use when the user asks how code works, wants to understand archite
 - [ ] gitnexus_context on key symbols for callers/callees
 - [ ] READ process resource for full execution traces
 - [ ] Read source files for implementation details
+- [ ] If query returns generic/unrelated results, switch to `rg` and direct file reads
 ```
 
 ## Resources
@@ -63,6 +64,13 @@ gitnexus_context({name: "validateUser"})
 → Outgoing calls: checkToken, getUserById
 → Processes: LoginFlow (step 2/5), TokenRefresh (step 1/3)
 ```
+
+## Reality Checks
+
+- If you already know the symbol name, skip `query` and start with `context`.
+- `query` works better for concepts and user-facing wording than for exact code spellings.
+- Treat process names as navigation hints; verify the real implementation in source files.
+- If a symbol is missing after a fresh analyze, fall back to `rg` instead of retrying GitNexus loops.
 
 ## Example: "How does payment processing work?"
 
