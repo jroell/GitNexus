@@ -69,6 +69,9 @@ Output:
 - Be concise and grounded.
 - Use tables or mermaid only when they add clarity.
 - End with a brief TLDR for non-trivial answers.`;
+
+const AGENT_RECURSION_LIMIT = 200;
+
 export const createChatModel = (config: ProviderConfig): BaseChatModel => {
   switch (config.provider) {
     case 'openai': {
@@ -274,7 +277,7 @@ export async function* streamAgentResponse(
       {
         streamMode: ['values', 'messages'] as any,
         // Allow longer tool/reasoning loops (more Cursor-like persistence)
-        recursionLimit: 50,
+        recursionLimit: AGENT_RECURSION_LIMIT,
       } as any
     );
     
@@ -484,7 +487,10 @@ export const invokeAgent = async (
     content: m.content,
   }));
   
-  const result = await agent.invoke({ messages: formattedMessages });
+  const result = await agent.invoke(
+    { messages: formattedMessages },
+    { recursionLimit: AGENT_RECURSION_LIMIT } as any
+  );
   
   // result.messages is the full conversation state
   const lastMessage = result.messages[result.messages.length - 1];
