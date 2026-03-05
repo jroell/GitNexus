@@ -81,6 +81,7 @@ export interface KnowledgeGraph {
   relationships: GraphRelationship[],
   nodeCount: number,
   relationshipCount: number,
+  getNode: (id: string) => GraphNode | undefined,
   addNode: (node: GraphNode) => void,
   addRelationship: (relationship: GraphRelationship) => void,
 }

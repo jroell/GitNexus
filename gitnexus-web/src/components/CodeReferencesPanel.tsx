@@ -31,10 +31,12 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
   const {
     graph,
     fileContents,
+    loadFileContent,
     selectedNode,
     codeReferences,
     removeCodeReference,
     clearCodeReferences,
+    serverBaseUrl,
     setSelectedNode,
     codeReferenceFocus,
   } = useAppState();
@@ -103,6 +105,34 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
 
   const aiReferences = useMemo(() => codeReferences.filter(r => r.source === 'ai'), [codeReferences]);
 
+  useEffect(() => {
+    const pathsToLoad = new Set<string>();
+
+    if (selectedNode?.properties?.filePath && !fileContents.has(selectedNode.properties.filePath)) {
+      pathsToLoad.add(selectedNode.properties.filePath);
+    }
+
+    for (const ref of aiReferences) {
+      if (!fileContents.has(ref.filePath)) {
+        pathsToLoad.add(ref.filePath);
+      }
+    }
+
+    if (pathsToLoad.size === 0) return;
+
+    let cancelled = false;
+    (async () => {
+      for (const path of pathsToLoad) {
+        if (cancelled) break;
+        await loadFileContent(path);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [aiReferences, fileContents, loadFileContent, selectedNode]);
+
   // When the user clicks a citation badge in chat, focus the corresponding snippet card:
   // - expand the panel if collapsed
   // - smooth-scroll the card into view
@@ -146,10 +176,10 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
 
   const refsWithSnippets = useMemo(() => {
     return aiReferences.map((ref) => {
-      const content = fileContents.get(ref.filePath);
-      if (!content) {
+      if (!fileContents.has(ref.filePath)) {
         return { ref, content: null as string | null, start: 0, end: 0, highlightStart: 0, highlightEnd: 0, totalLines: 0 };
       }
+      const content = fileContents.get(ref.filePath) ?? '';
 
       const lines = content.split('\n');
       const totalLines = lines.length;
@@ -175,7 +205,8 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
   }, [aiReferences, fileContents]);
 
   const selectedFilePath = selectedNode?.properties?.filePath;
-  const selectedFileContent = selectedFilePath ? fileContents.get(selectedFilePath) : undefined;
+  const hasSelectedFileContent = selectedFilePath ? fileContents.has(selectedFilePath) : false;
+  const selectedFileContent = selectedFilePath && hasSelectedFileContent ? fileContents.get(selectedFilePath) ?? '' : undefined;
   const selectedIsFile = selectedNode?.label === 'File' && !!selectedFilePath;
   const showSelectedViewer = !!selectedNode && !!selectedFilePath;
   const showCitations = aiReferences.length > 0;
@@ -265,7 +296,7 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
               </button>
             </div>
             <div className="flex-1 min-h-0 overflow-auto scrollbar-thin">
-              {selectedFileContent ? (
+              {hasSelectedFileContent ? (
                 <SyntaxHighlighter
                   language={
                     selectedFilePath?.endsWith('.py') ? 'python' :
@@ -302,12 +333,14 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
                   }}
                   wrapLines
                 >
-                  {selectedFileContent}
+                  {selectedFileContent ?? ''}
                 </SyntaxHighlighter>
               ) : (
                 <div className="px-3 py-3 text-sm text-text-muted">
-                  {selectedIsFile ? (
-                    <>Code not available in memory for <span className="font-mono">{selectedFilePath}</span></>
+                  {selectedIsFile && serverBaseUrl ? (
+                    <>Loading code for <span className="font-mono">{selectedFilePath}</span></>
+                  ) : selectedIsFile ? (
+                    <>Code not available for <span className="font-mono">{selectedFilePath}</span></>
                   ) : (
                     <>Select a file node to preview its contents.</>
                   )}
@@ -387,7 +420,7 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
                         const nodeId = ref.nodeId!;
                         // Sync selection + focus graph
                         if (graph) {
-                          const node = graph.nodes.find((n) => n.id === nodeId);
+                          const node = graph.getNode(nodeId);
                           if (node) setSelectedNode(node);
                         }
                         onFocusNode(nodeId);
@@ -409,7 +442,7 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
               </div>
 
               <div className="overflow-x-auto">
-                {content ? (
+                {content !== null ? (
                   <SyntaxHighlighter
                     language={language}
                     style={customTheme as any}
@@ -439,11 +472,13 @@ export const CodeReferencesPanel = ({ onFocusNode }: CodeReferencesPanelProps) =
                     }}
                     wrapLines
                   >
-                    {content}
+                    {content ?? ''}
                   </SyntaxHighlighter>
                 ) : (
                   <div className="px-3 py-3 text-sm text-text-muted">
-                    Code not available in memory for <span className="font-mono">{ref.filePath}</span>
+                    {serverBaseUrl
+                      ? <>Loading code for <span className="font-mono">{ref.filePath}</span></>
+                      : <>Code not available for <span className="font-mono">{ref.filePath}</span></>}
                   </div>
                 )}
               </div>

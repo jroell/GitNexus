@@ -97,9 +97,9 @@ export interface GraphRelationship {
 }
 
 export interface KnowledgeGraph {
-  /** Returns a full array copy — prefer iterNodes() for iteration */
+  /** Stable node array view — prefer iterNodes()/forEachNode() in hot loops */
   nodes: GraphNode[],
-  /** Returns a full array copy — prefer iterRelationships() for iteration */
+  /** Stable relationship array view — prefer iterRelationships()/forEachRelationship() in hot loops */
   relationships: GraphRelationship[],
   /** Zero-copy iterator over nodes */
   iterNodes: () => IterableIterator<GraphNode>,

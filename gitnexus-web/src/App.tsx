@@ -11,7 +11,7 @@ import { FileTreePanel } from './components/FileTreePanel';
 import { CodeReferencesPanel } from './components/CodeReferencesPanel';
 import { FileEntry } from './services/zip';
 import { getActiveProviderConfig } from './core/llm/settings-service';
-import { createKnowledgeGraph } from './core/graph/graph';
+import { createKnowledgeGraphFromData } from './core/graph/graph';
 import { connectToServer, fetchRepos, normalizeServerUrl, type ConnectToServerResult } from './services/server-connection';
 
 const AppContent = () => {
@@ -135,28 +135,15 @@ const AppContent = () => {
   const handleServerConnect = useCallback((result: ConnectToServerResult) => {
     // Extract project name from repoPath
     const repoPath = result.repoInfo.repoPath;
-    const projectName = repoPath.split('/').pop() || 'server-project';
+    const projectName = result.repoInfo.name || repoPath.split('/').pop() || 'server-project';
     setProjectName(projectName);
 
-    // Build KnowledgeGraph from server data (bypasses WASM pipeline entirely)
-    const graph = createKnowledgeGraph();
-    for (const node of result.nodes) {
-      graph.addNode(node);
-    }
-    for (const rel of result.relationships) {
-      graph.addRelationship(rel);
-    }
-    setGraph(graph);
-
-    // Set file contents from extracted File node content
-    const fileMap = new Map<string, string>();
-    for (const [path, content] of Object.entries(result.fileContents)) {
-      fileMap.set(path, content);
-    }
-    setFileContents(fileMap);
+    setGraph(createKnowledgeGraphFromData(result.nodes, result.relationships));
+    setFileContents(new Map<string, string>());
 
     // Transition directly to exploring view
     setViewMode('exploring');
+    setProgress(null);
 
     // Initialize agent if LLM is configured
     if (getActiveProviderConfig()) {
@@ -171,7 +158,7 @@ const AppContent = () => {
         console.warn('Embeddings auto-start failed:', err);
       }
     });
-  }, [setViewMode, setGraph, setFileContents, setProjectName, initializeAgent, startEmbeddings]);
+  }, [setViewMode, setGraph, setFileContents, setProjectName, initializeAgent, startEmbeddings, setProgress]);
 
   // Auto-connect when ?server query param is present (bookmarkable shortcut)
   const autoConnectRan = useRef(false);
@@ -199,8 +186,8 @@ const AppContent = () => {
         const pct = total ? Math.round((downloaded / total) * 90) + 5 : 50;
         const mb = (downloaded / (1024 * 1024)).toFixed(1);
         setProgress({ phase: 'extracting', percent: pct, message: 'Downloading graph...', detail: `${mb} MB downloaded` });
-      } else if (phase === 'extracting') {
-        setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Extracting file contents' });
+      } else if (phase === 'hydrating') {
+        setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Hydrating graph indexes' });
       }
     }).then(async (result) => {
       handleServerConnect(result);

@@ -42,15 +42,10 @@ export const serializePipelineResult = (result: PipelineResult): SerializablePip
 // Helper to reconstruct from serializable format (used in main thread)
 export const deserializePipelineResult = (
   serialized: SerializablePipelineResult,
-  createGraph: () => KnowledgeGraph
+  createGraph: (nodes: GraphNode[], relationships: GraphRelationship[]) => KnowledgeGraph
 ): PipelineResult => {
-  const graph = createGraph();
-  serialized.nodes.forEach(node => graph.addNode(node));
-  serialized.relationships.forEach(rel => graph.addRelationship(rel));
-  
   return {
-    graph,
+    graph: createGraph(serialized.nodes, serialized.relationships),
     fileContents: new Map(Object.entries(serialized.fileContents)),
   };
 };
-

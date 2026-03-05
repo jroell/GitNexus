@@ -61,6 +61,21 @@ function logQueryError(context: string, err: unknown): void {
   console.error(`GitNexus [${context}]: ${msg}`);
 }
 
+function escapeCypherString(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "''");
+}
+
+function toCypherStringList(values: Iterable<string>): string {
+  const unique = Array.from(new Set(values));
+  if (unique.length === 0) return '[]';
+  return `[${unique.map(value => `'${escapeCypherString(value)}'`).join(', ')}]`;
+}
+
+function getNodeLabelFromId(nodeId: string): string {
+  const labelEndIdx = nodeId.indexOf(':');
+  return labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : '';
+}
+
 export interface CodebaseContext {
   projectName: string;
   stats: {
@@ -86,6 +101,7 @@ export class LocalBackend {
   private repos: Map<string, RepoHandle> = new Map();
   private contextCache: Map<string, CodebaseContext> = new Map();
   private initializedRepos: Set<string> = new Set();
+  private embeddingAvailability: Map<string, boolean> = new Map();
 
   // ─── Initialization ──────────────────────────────────────────────
 
@@ -284,6 +300,111 @@ export class LocalBackend {
     }));
   }
 
+  private async fetchProcessParticipation(repo: RepoHandle, nodeIds: string[]): Promise<Map<string, any[]>> {
+    const rowsByNode = new Map<string, any[]>();
+    if (nodeIds.length === 0) return rowsByNode;
+
+    try {
+      const rows = await executeQuery(repo.id, `
+        MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+        WHERE n.id IN ${toCypherStringList(nodeIds)}
+        RETURN n.id AS nodeId, p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
+      `);
+
+      for (const row of rows) {
+        const nodeId = row.nodeId ?? row[0];
+        if (!nodeId) continue;
+        const list = rowsByNode.get(nodeId) ?? [];
+        list.push({
+          pid: row.pid ?? row[1],
+          label: row.label ?? row[2],
+          heuristicLabel: row.heuristicLabel ?? row[3],
+          processType: row.processType ?? row[4],
+          stepCount: row.stepCount ?? row[5],
+          step: row.step ?? row[6],
+        });
+        rowsByNode.set(nodeId, list);
+      }
+    } catch (err) {
+      logQueryError('batch:process-participation', err);
+    }
+
+    return rowsByNode;
+  }
+
+  private async fetchCommunityInfo(repo: RepoHandle, nodeIds: string[]): Promise<Map<string, { cohesion: number; module?: string }>> {
+    const communityByNode = new Map<string, { cohesion: number; module?: string }>();
+    if (nodeIds.length === 0) return communityByNode;
+
+    try {
+      const rows = await executeQuery(repo.id, `
+        MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+        WHERE n.id IN ${toCypherStringList(nodeIds)}
+        RETURN n.id AS nodeId, c.cohesion AS cohesion, c.heuristicLabel AS module
+        ORDER BY c.cohesion DESC
+      `);
+
+      for (const row of rows) {
+        const nodeId = row.nodeId ?? row[0];
+        if (!nodeId || communityByNode.has(nodeId)) continue;
+        communityByNode.set(nodeId, {
+          cohesion: (row.cohesion ?? row[1]) || 0,
+          module: row.module ?? row[2],
+        });
+      }
+    } catch (err) {
+      logQueryError('batch:community-info', err);
+    }
+
+    return communityByNode;
+  }
+
+  private async fetchNodeMetadata(
+    repo: RepoHandle,
+    nodeIds: string[],
+    includeContent: boolean = false,
+  ): Promise<Map<string, { id: string; name?: string; type: string; filePath: string; startLine?: number; endLine?: number; content?: string }>> {
+    const metadata = new Map<string, { id: string; name?: string; type: string; filePath: string; startLine?: number; endLine?: number; content?: string }>();
+    if (nodeIds.length === 0) return metadata;
+
+    const byLabel = new Map<string, string[]>();
+    for (const nodeId of nodeIds) {
+      const label = getNodeLabelFromId(nodeId);
+      if (!VALID_NODE_LABELS.has(label)) continue;
+      const list = byLabel.get(label) ?? [];
+      list.push(nodeId);
+      byLabel.set(label, list);
+    }
+
+    for (const [label, ids] of byLabel) {
+      try {
+        const rows = await executeQuery(repo.id, `
+          MATCH (n:\`${label}\`)
+          WHERE n.id IN ${toCypherStringList(ids)}
+          RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine${includeContent ? ', n.content AS content' : ''}
+        `);
+
+        for (const row of rows) {
+          const id = row.id ?? row[0];
+          if (!id) continue;
+          metadata.set(id, {
+            id,
+            name: row.name ?? row[1] ?? undefined,
+            type: label,
+            filePath: row.filePath ?? row[2] ?? '',
+            startLine: row.startLine ?? row[3],
+            endLine: row.endLine ?? row[4],
+            ...(includeContent ? { content: row.content ?? row[5] ?? undefined } : {}),
+          });
+        }
+      } catch (err) {
+        logQueryError(`batch:node-metadata:${label}`, err);
+      }
+    }
+
+    return metadata;
+  }
+
   // ─── Tool Dispatch ───────────────────────────────────────────────
 
   async callTool(method: string, params: any): Promise<any> {
@@ -384,63 +505,44 @@ export class LocalBackend {
       }
     }
     
-    const merged = Array.from(scoreMap.entries())
-      .sort((a, b) => b[1].score - a[1].score)
+    const merged = Array.from(scoreMap.values())
+      .sort((a, b) => b.score - a.score)
       .slice(0, searchLimit);
-    
+
+    const mergedNodeIds = Array.from(
+      new Set(
+        merged
+          .map(item => item.data.nodeId)
+          .filter((nodeId): nodeId is string => typeof nodeId === 'string' && nodeId.length > 0),
+      ),
+    );
+
+    const [processRowsByNode, communityByNode] = await Promise.all([
+      this.fetchProcessParticipation(repo, mergedNodeIds),
+      this.fetchCommunityInfo(repo, mergedNodeIds),
+    ]);
+
     // Step 2: For each match with a nodeId, trace to process(es)
     const processMap = new Map<string, { id: string; label: string; heuristicLabel: string; processType: string; stepCount: number; totalScore: number; cohesionBoost: number; symbols: any[] }>();
     const definitions: any[] = []; // standalone symbols not in any process
     
-    for (const [_, item] of merged) {
+    for (const item of merged) {
       const sym = item.data;
       if (!sym.nodeId) {
         // File-level results go to definitions
         definitions.push({
+          id: undefined,
           name: sym.name,
           type: sym.type || 'File',
           filePath: sym.filePath,
         });
         continue;
       }
-      
-      // Find processes this symbol participates in
-      let processRows: any[] = [];
-      try {
-        processRows = await executeParameterized(repo.id, `
-          MATCH (n {id: $nodeId})-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-          RETURN p.id AS pid, p.label AS label, p.heuristicLabel AS heuristicLabel, p.processType AS processType, p.stepCount AS stepCount, r.step AS step
-        `, { nodeId: sym.nodeId });
-      } catch (e) { logQueryError('query:process-lookup', e); }
 
-      // Get cluster membership + cohesion (cohesion used as internal ranking signal)
-      let cohesion = 0;
-      let module: string | undefined;
-      try {
-        const cohesionRows = await executeParameterized(repo.id, `
-          MATCH (n {id: $nodeId})-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-          RETURN c.cohesion AS cohesion, c.heuristicLabel AS module
-          LIMIT 1
-        `, { nodeId: sym.nodeId });
-        if (cohesionRows.length > 0) {
-          cohesion = (cohesionRows[0].cohesion ?? cohesionRows[0][0]) || 0;
-          module = cohesionRows[0].module ?? cohesionRows[0][1];
-        }
-      } catch (e) { logQueryError('query:cluster-info', e); }
-
-      // Optionally fetch content
-      let content: string | undefined;
-      if (includeContent) {
-        try {
-          const contentRows = await executeParameterized(repo.id, `
-            MATCH (n {id: $nodeId})
-            RETURN n.content AS content
-          `, { nodeId: sym.nodeId });
-          if (contentRows.length > 0) {
-            content = contentRows[0].content ?? contentRows[0][0];
-          }
-        } catch (e) { logQueryError('query:content-fetch', e); }
-      }
+      const processRows = processRowsByNode.get(sym.nodeId) ?? [];
+      const communityInfo = communityByNode.get(sym.nodeId);
+      const cohesion = communityInfo?.cohesion ?? 0;
+      const module = communityInfo?.module;
 
       const symbolEntry = {
         id: sym.nodeId,
@@ -450,7 +552,6 @@ export class LocalBackend {
         startLine: sym.startLine,
         endLine: sym.endLine,
         ...(module ? { module } : {}),
-        ...(includeContent && content ? { content } : {}),
       };
       
       if (processRows.length === 0) {
@@ -499,6 +600,20 @@ export class LocalBackend {
       }))
       .sort((a, b) => b.priority - a.priority)
       .slice(0, processLimit);
+
+    let contentByNode = new Map<string, { content?: string }>();
+    if (includeContent) {
+      const contentNodeIds = new Set<string>();
+      for (const process of rankedProcesses) {
+        for (const symbol of process.symbols.slice(0, maxSymbolsPerProcess)) {
+          if (symbol.id) contentNodeIds.add(symbol.id);
+        }
+      }
+      for (const definition of definitions.slice(0, 20)) {
+        if (definition.id) contentNodeIds.add(definition.id);
+      }
+      contentByNode = await this.fetchNodeMetadata(repo, Array.from(contentNodeIds), true);
+    }
     
     // Step 4: Build response
     const processes = rankedProcesses.map(p => ({
@@ -513,6 +628,9 @@ export class LocalBackend {
     const processSymbols = rankedProcesses.flatMap(p =>
       p.symbols.slice(0, maxSymbolsPerProcess).map(s => ({
         ...s,
+        ...(includeContent && s.id && contentByNode.get(s.id)?.content
+          ? { content: contentByNode.get(s.id)!.content }
+          : {}),
         // remove internal fields
       }))
     );
@@ -528,7 +646,12 @@ export class LocalBackend {
     return {
       processes,
       process_symbols: dedupedSymbols,
-      definitions: definitions.slice(0, 20), // cap standalone definitions
+      definitions: definitions.slice(0, 20).map(def => ({
+        ...def,
+        ...(includeContent && def.id && contentByNode.get(def.id)?.content
+          ? { content: contentByNode.get(def.id)!.content }
+          : {}),
+      })),
     };
   }
 
@@ -536,60 +659,24 @@ export class LocalBackend {
    * BM25 keyword search helper - uses KuzuDB FTS for always-fresh results
    */
   private async bm25Search(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
-    const { searchFTSFromKuzu } = await import('../../core/search/bm25-index.js');
+    const { searchFTSNodesFromKuzu } = await import('../../core/search/bm25-index.js');
     let bm25Results;
     try {
-      bm25Results = await searchFTSFromKuzu(query, limit, repo.id);
+      bm25Results = await searchFTSNodesFromKuzu(query, limit, repo.id);
     } catch (err: any) {
       console.error('GitNexus: BM25/FTS search failed (FTS indexes may not exist) -', err.message);
       return [];
     }
-    
-    const results: any[] = [];
-    
-    for (const bm25Result of bm25Results) {
-      const fullPath = bm25Result.filePath;
-      try {
-        const symbols = await executeParameterized(repo.id, `
-          MATCH (n)
-          WHERE n.filePath = $filePath
-          RETURN n.id AS id, n.name AS name, labels(n)[0] AS type, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine
-          LIMIT 3
-        `, { filePath: fullPath });
-        
-        if (symbols.length > 0) {
-          for (const sym of symbols) {
-            results.push({
-              nodeId: sym.id || sym[0],
-              name: sym.name || sym[1],
-              type: sym.type || sym[2],
-              filePath: sym.filePath || sym[3],
-              startLine: sym.startLine || sym[4],
-              endLine: sym.endLine || sym[5],
-              bm25Score: bm25Result.score,
-            });
-          }
-        } else {
-          const fileName = fullPath.split('/').pop() || fullPath;
-          results.push({
-            name: fileName,
-            type: 'File',
-            filePath: bm25Result.filePath,
-            bm25Score: bm25Result.score,
-          });
-        }
-      } catch {
-        const fileName = fullPath.split('/').pop() || fullPath;
-        results.push({
-          name: fileName,
-          type: 'File',
-          filePath: bm25Result.filePath,
-          bm25Score: bm25Result.score,
-        });
-      }
-    }
-    
-    return results;
+
+    return bm25Results.map(result => ({
+      nodeId: result.nodeId,
+      name: result.name || result.filePath.split('/').pop() || result.filePath,
+      type: result.label,
+      filePath: result.filePath,
+      startLine: result.startLine,
+      endLine: result.endLine,
+      bm25Score: result.score,
+    }));
   }
 
   /**
@@ -597,9 +684,14 @@ export class LocalBackend {
    */
   private async semanticSearch(repo: RepoHandle, query: string, limit: number): Promise<any[]> {
     try {
-      // Check if embedding table exists before loading the model (avoids heavy model init when embeddings are off)
-      const tableCheck = await executeQuery(repo.id, `MATCH (e:CodeEmbedding) RETURN COUNT(*) AS cnt LIMIT 1`);
-      if (!tableCheck.length || (tableCheck[0].cnt ?? tableCheck[0][0]) === 0) return [];
+      const cachedAvailability = this.embeddingAvailability.get(repo.id);
+      if (cachedAvailability === false) return [];
+      if (cachedAvailability === undefined) {
+        const tableCheck = await executeQuery(repo.id, `MATCH (e:CodeEmbedding) RETURN e.nodeId AS nodeId LIMIT 1`);
+        const hasEmbeddings = tableCheck.length > 0;
+        this.embeddingAvailability.set(repo.id, hasEmbeddings);
+        if (!hasEmbeddings) return [];
+      }
 
       const { embedQuery, getEmbeddingDims } = await import('../core/embedder.js');
       const queryVec = await embedQuery(query);
@@ -619,40 +711,33 @@ export class LocalBackend {
       const embResults = await executeQuery(repo.id, vectorQuery);
       
       if (embResults.length === 0) return [];
-      
-      const results: any[] = [];
-      
+
+      const distances = new Map<string, number>();
+      const nodeIds: string[] = [];
       for (const embRow of embResults) {
         const nodeId = embRow.nodeId ?? embRow[0];
-        const distance = embRow.distance ?? embRow[1];
-        
-        const labelEndIdx = nodeId.indexOf(':');
-        const label = labelEndIdx > 0 ? nodeId.substring(0, labelEndIdx) : 'Unknown';
-        
-        // Validate label against known node types to prevent Cypher injection
-        if (!VALID_NODE_LABELS.has(label)) continue;
-        
-        try {
-          const nodeQuery = label === 'File'
-            ? `MATCH (n:File {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath`
-            : `MATCH (n:\`${label}\` {id: $nodeId}) RETURN n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine`;
-
-          const nodeRows = await executeParameterized(repo.id, nodeQuery, { nodeId });
-          if (nodeRows.length > 0) {
-            const nodeRow = nodeRows[0];
-            results.push({
-              nodeId,
-              name: nodeRow.name ?? nodeRow[0] ?? '',
-              type: label,
-              filePath: nodeRow.filePath ?? nodeRow[1] ?? '',
-              distance,
-              startLine: label !== 'File' ? (nodeRow.startLine ?? nodeRow[2]) : undefined,
-              endLine: label !== 'File' ? (nodeRow.endLine ?? nodeRow[3]) : undefined,
-            });
-          }
-        } catch {}
+        if (typeof nodeId !== 'string' || !nodeId) continue;
+        distances.set(nodeId, embRow.distance ?? embRow[1] ?? 0);
+        nodeIds.push(nodeId);
       }
-      
+
+      const metadata = await this.fetchNodeMetadata(repo, nodeIds, false);
+      const results: any[] = [];
+
+      for (const nodeId of nodeIds) {
+        const meta = metadata.get(nodeId);
+        if (!meta) continue;
+        results.push({
+          nodeId,
+          name: meta.name ?? '',
+          type: meta.type,
+          filePath: meta.filePath,
+          distance: distances.get(nodeId) ?? 0,
+          startLine: meta.startLine,
+          endLine: meta.endLine,
+        });
+      }
+
       return results;
     } catch {
       // Expected when embeddings are disabled — silently fall back to BM25-only

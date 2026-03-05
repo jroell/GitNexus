@@ -502,7 +502,7 @@ export const DropZone = ({ onFileSelect, onGitClone, onServerConnect }: DropZone
                           ? serverProgressPercent !== null
                             ? `Downloading... ${serverProgressPercent}%`
                             : `Downloading... ${formatBytes(serverProgress.downloaded)}`
-                          : serverProgress.phase === 'extracting'
+                          : serverProgress.phase === 'hydrating'
                             ? 'Processing...'
                             : 'Connecting...'
                       }

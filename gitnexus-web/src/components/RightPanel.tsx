@@ -12,8 +12,8 @@ export const RightPanel = () => {
   const {
     isRightPanelOpen,
     setRightPanelOpen,
-    fileContents,
     graph,
+    resolveFilePath,
     addCodeReference,
     // LLM / chat state
     chatMessages,
@@ -38,28 +38,6 @@ export const RightPanel = () => {
       messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [chatMessages, isChatLoading]);
-
-  const resolveFilePathForUI = useCallback((requestedPath: string): string | null => {
-    const req = requestedPath.replace(/\\/g, '/').replace(/^\.?\//, '').toLowerCase();
-    if (!req) return null;
-
-    // Exact match first (case-insensitive)
-    for (const key of fileContents.keys()) {
-      const norm = key.replace(/\\/g, '/').replace(/^\.?\//, '').toLowerCase();
-      if (norm === req) return key;
-    }
-
-    // Ends-with match (best for partial paths)
-    let best: { path: string; score: number } | null = null;
-    for (const key of fileContents.keys()) {
-      const norm = key.replace(/\\/g, '/').replace(/^\.?\//, '').toLowerCase();
-      if (norm.endsWith(req)) {
-        const score = 1000 - norm.length;
-        if (!best || score > best.score) best = { path: key, score };
-      }
-    }
-    return best?.path ?? null;
-  }, [fileContents]);
 
   const findFileNodeIdForUI = useCallback((filePath: string): string | undefined => {
     if (!graph) return undefined;
@@ -86,7 +64,7 @@ export const RightPanel = () => {
       endLine1 = parseInt(lineMatch[3] || lineMatch[2], 10);
     }
 
-    const resolvedPath = resolveFilePathForUI(rawPath);
+    const resolvedPath = resolveFilePath(rawPath);
     if (!resolvedPath) return;
 
     const nodeId = findFileNodeIdForUI(resolvedPath);
@@ -100,7 +78,7 @@ export const RightPanel = () => {
       name: resolvedPath.split('/').pop() ?? resolvedPath,
       source: 'ai',
     });
-  }, [addCodeReference, findFileNodeIdForUI, resolveFilePathForUI]);
+  }, [addCodeReference, findFileNodeIdForUI, resolveFilePath]);
 
   // Handler for node grounding: [[Class:View]], [[Function:trigger]], etc.
   const handleNodeGroundingClick = useCallback((nodeTypeAndName: string) => {
@@ -131,7 +109,7 @@ export const RightPanel = () => {
 
     // 2. Add to Code Panel (if node has file/line info)
     if (node.properties.filePath) {
-      const resolvedPath = resolveFilePathForUI(node.properties.filePath);
+      const resolvedPath = resolveFilePath(node.properties.filePath);
       if (resolvedPath) {
         addCodeReference({
           filePath: resolvedPath,
@@ -144,7 +122,7 @@ export const RightPanel = () => {
         });
       }
     }
-  }, [graph, resolveFilePathForUI, addCodeReference]);
+  }, [graph, resolveFilePath, addCodeReference]);
 
   const handleLinkClick = useCallback((href: string) => {
     if (href.startsWith('code-ref:')) {
@@ -446,6 +424,5 @@ export const RightPanel = () => {
     </aside>
   );
 };
-
 
 

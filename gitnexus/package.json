@@ -39,6 +39,9 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx watch src/cli/index.ts",
+    "perf": "npm run build && tsx test/perf/indexing-mcp-benchmark.ts",
+    "perf:write-baseline": "npm run build && tsx test/perf/indexing-mcp-benchmark.ts --write-baseline",
+    "perf:check": "npm run build && tsx test/perf/indexing-mcp-benchmark.ts --check",
     "test": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
     "test:all": "vitest run",

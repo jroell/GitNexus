@@ -144,24 +144,29 @@ describe('createKnowledgeGraph', () => {
 
   // ─── nodes / relationships arrays ──────────────────────────────────
 
-  it('.nodes returns an array copy', () => {
+  it('.nodes returns a stable live view', () => {
     const g = createKnowledgeGraph();
     g.addNode(makeNode('fn:a', 'a'));
     const arr1 = g.nodes;
     const arr2 = g.nodes;
-    expect(arr1).not.toBe(arr2); // different array instances
+    expect(arr1).toBe(arr2);
     expect(arr1).toHaveLength(1);
+    g.addNode(makeNode('fn:b', 'b'));
+    expect(arr1).toHaveLength(2);
   });
 
-  it('.relationships returns an array copy', () => {
+  it('.relationships returns a stable live view', () => {
     const g = createKnowledgeGraph();
     g.addNode(makeNode('fn:a', 'a'));
     g.addNode(makeNode('fn:b', 'b'));
     g.addRelationship(makeRel('fn:a', 'fn:b'));
     const arr1 = g.relationships;
     const arr2 = g.relationships;
-    expect(arr1).not.toBe(arr2);
+    expect(arr1).toBe(arr2);
     expect(arr1).toHaveLength(1);
+    g.addNode(makeNode('fn:c', 'c'));
+    g.addRelationship(makeRel('fn:b', 'fn:c'));
+    expect(arr1).toHaveLength(2);
   });
 
   // ─── forEachNode / forEachRelationship ──────────────────────────────

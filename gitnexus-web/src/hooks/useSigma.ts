@@ -75,12 +75,39 @@ interface UseSigmaReturn {
   refreshHighlights: () => void;
 }
 
+type LayoutMode = 'auto' | 'manual';
+
 // Noverlap for final cleanup - minimal since it starts with good positions
 const NOVERLAP_SETTINGS = {
   maxIterations: 20,  // Reduced - less cleanup needed
   ratio: 1.1,
   margin: 10,
   expansion: 1.05,
+};
+
+const AUTO_LAYOUT_NODE_LIMIT = 6000;
+const REDUCED_NOVERLAP_NODE_LIMIT = 10000;
+
+const shouldAutoRunLayout = (nodeCount: number): boolean => nodeCount <= AUTO_LAYOUT_NODE_LIMIT;
+
+const getNoverlapSettings = (
+  nodeCount: number,
+  mode: LayoutMode,
+): typeof NOVERLAP_SETTINGS | null => {
+  if (nodeCount > REDUCED_NOVERLAP_NODE_LIMIT) {
+    return null;
+  }
+
+  if (nodeCount > 4000) {
+    return {
+      maxIterations: mode === 'manual' ? 6 : 4,
+      ratio: 1.03,
+      margin: 4,
+      expansion: 1.01,
+    };
+  }
+
+  return NOVERLAP_SETTINGS;
 };
 
 // ForceAtlas2 settings - FAST convergence since nodes start near their parents
@@ -114,13 +141,13 @@ const getFA2Settings = (nodeCount: number) => {
 
 // Layout duration - let it run longer for better results
 // Web Worker + WebGL means minimal system impact
-const getLayoutDuration = (nodeCount: number): number => {
-  if (nodeCount > 10000) return 45000;  // 45s for huge graphs
-  if (nodeCount > 5000) return 35000;   // 35s
-  if (nodeCount > 2000) return 30000;   // 30s
-  if (nodeCount > 1000) return 30000;   // 30s
-  if (nodeCount > 500) return 25000;    // 25s
-  return 20000;                         // 20s for small graphs
+const getLayoutDuration = (nodeCount: number, mode: LayoutMode): number => {
+  if (nodeCount > 10000) return mode === 'manual' ? 12000 : 0;
+  if (nodeCount > 5000) return mode === 'manual' ? 9000 : 5000;
+  if (nodeCount > 2000) return mode === 'manual' ? 7000 : 4500;
+  if (nodeCount > 1000) return mode === 'manual' ? 6000 : 3500;
+  if (nodeCount > 500) return mode === 'manual' ? 5000 : 3000;
+  return mode === 'manual' ? 4000 : 2500;
 };
 
 export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
@@ -492,10 +519,53 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
     };
   }, []);
 
+  const finalizeLayout = useCallback((mode: LayoutMode) => {
+    if (layoutTimeoutRef.current) {
+      clearTimeout(layoutTimeoutRef.current);
+      layoutTimeoutRef.current = null;
+    }
+
+    const layout = layoutRef.current;
+    layoutRef.current = null;
+
+    if (layout) {
+      try {
+        layout.stop();
+      } catch {}
+      try {
+        layout.kill();
+      } catch {}
+    }
+
+    const graph = graphRef.current;
+    try {
+      if (graph) {
+        const cleanupSettings = getNoverlapSettings(graph.order, mode);
+        if (cleanupSettings) {
+          noverlap.assign(graph, cleanupSettings);
+        }
+      }
+    } catch (error) {
+      console.warn('Layout cleanup failed:', error);
+    } finally {
+      sigmaRef.current?.refresh();
+      setIsLayoutRunning(false);
+    }
+  }, []);
+
   // Run ForceAtlas2 layout
-  const runLayout = useCallback((graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>) => {
+  const runLayout = useCallback((graph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>, mode: LayoutMode) => {
     const nodeCount = graph.order;
-    if (nodeCount === 0) return;
+    if (nodeCount === 0) {
+      setIsLayoutRunning(false);
+      return;
+    }
+
+    if (mode === 'auto' && !shouldAutoRunLayout(nodeCount)) {
+      setIsLayoutRunning(false);
+      sigmaRef.current?.refresh();
+      return;
+    }
 
     // Kill existing
     if (layoutRef.current) {
@@ -511,28 +581,29 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
     const inferredSettings = forceAtlas2.inferSettings(graph);
     const customSettings = getFA2Settings(nodeCount);
     const settings = { ...inferredSettings, ...customSettings };
-    
-    const layout = new FA2Layout(graph, { settings });
-    
-    layoutRef.current = layout;
-    layout.start();
-    setIsLayoutRunning(true);
+    const duration = getLayoutDuration(nodeCount, mode);
+    if (duration <= 0) {
+      setIsLayoutRunning(false);
+      sigmaRef.current?.refresh();
+      return;
+    }
 
-    const duration = getLayoutDuration(nodeCount);
-    
-    layoutTimeoutRef.current = setTimeout(() => {
-      if (layoutRef.current) {
-        layoutRef.current.stop();
-        layoutRef.current = null;
-        
-        // Light noverlap cleanup
-        noverlap.assign(graph, NOVERLAP_SETTINGS);
-        sigmaRef.current?.refresh();
-        
-        setIsLayoutRunning(false);
-      }
-    }, duration);
-  }, []);
+    try {
+      const layout = new FA2Layout(graph, { settings });
+      layoutRef.current = layout;
+      layout.start();
+      setIsLayoutRunning(true);
+
+      layoutTimeoutRef.current = setTimeout(() => {
+        if (layoutRef.current === layout) {
+          finalizeLayout(mode);
+        }
+      }, duration);
+    } catch (error) {
+      console.warn('Failed to start graph layout:', error);
+      finalizeLayout(mode);
+    }
+  }, [finalizeLayout]);
 
   const setGraph = useCallback((newGraph: Graph<SigmaNodeAttributes, SigmaEdgeAttributes>) => {
     const sigma = sigmaRef.current;
@@ -551,7 +622,7 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
     sigma.setGraph(newGraph);
     setSelectedNode(null);
 
-    runLayout(newGraph);
+    runLayout(newGraph, 'auto');
     sigma.getCamera().animatedReset({ duration: 500 });
   }, [runLayout, setSelectedNode]);
 
@@ -595,27 +666,12 @@ export const useSigma = (options: UseSigmaOptions = {}): UseSigmaReturn => {
   const startLayout = useCallback(() => {
     const graph = graphRef.current;
     if (!graph || graph.order === 0) return;
-    runLayout(graph);
+    runLayout(graph, 'manual');
   }, [runLayout]);
 
   const stopLayout = useCallback(() => {
-    if (layoutTimeoutRef.current) {
-      clearTimeout(layoutTimeoutRef.current);
-      layoutTimeoutRef.current = null;
-    }
-    if (layoutRef.current) {
-      layoutRef.current.stop();
-      layoutRef.current = null;
-      
-      const graph = graphRef.current;
-      if (graph) {
-        noverlap.assign(graph, NOVERLAP_SETTINGS);
-        sigmaRef.current?.refresh();
-      }
-      
-      setIsLayoutRunning(false);
-    }
-  }, []);
+    finalizeLayout('manual');
+  }, [finalizeLayout]);
 
   const refreshHighlights = useCallback(() => {
     sigmaRef.current?.refresh();

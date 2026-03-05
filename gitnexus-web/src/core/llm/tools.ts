@@ -16,6 +16,23 @@ import { z } from 'zod';
 // Note: GRAPH_SCHEMA_DESCRIPTION from './types' is available if needed for additional context
 import { WebGPUNotAvailableError, embedText, embeddingToArray, initEmbedder, isEmbedderReady } from '../embeddings/embedder';
 
+export interface GraphRAGGrepMatch {
+  file: string;
+  line: number;
+  content: string;
+}
+
+export interface GraphRAGFileAccess {
+  getKnownFilePaths?: () => Iterable<string>;
+  readFile?: (filePath: string) => Promise<string | null>;
+  grepFiles?: (params: {
+    pattern: string;
+    fileFilter?: string;
+    caseSensitive?: boolean;
+    maxResults?: number;
+  }) => Promise<GraphRAGGrepMatch[]>;
+}
+
 /**
  * Tool factory - creates tools bound to the KuzuDB query functions
  */
@@ -26,8 +43,71 @@ export const createGraphRAGTools = (
   hybridSearch: (query: string, k?: number) => Promise<any[]>,
   isEmbeddingReady: () => boolean,
   isBM25Ready: () => boolean,
-  fileContents: Map<string, string>
+  fileContents: Map<string, string>,
+  fileAccess: GraphRAGFileAccess = {},
 ) => {
+  const escapeCypherString = (value: string): string => value.replace(/\\/g, '\\\\').replace(/'/g, "''");
+  const toCypherStringList = (values: string[]): string =>
+    `[${Array.from(new Set(values)).map(value => `'${escapeCypherString(value)}'`).join(', ')}]`;
+  const normalizePath = (value: string): string => value.replace(/\\/g, '/').replace(/^\.?\//, '').toLowerCase();
+  const getKnownFilePaths = (): string[] => {
+    const paths = new Set<string>(fileContents.keys());
+    for (const path of fileAccess.getKnownFilePaths?.() ?? []) {
+      if (path) paths.add(path);
+    }
+    return Array.from(paths);
+  };
+  const resolvePath = (requestedPath: string): string | null => {
+    const normalizedRequest = normalizePath(requestedPath);
+    if (!normalizedRequest) return null;
+
+    const candidates = getKnownFilePaths();
+
+    for (const path of candidates) {
+      if (normalizePath(path) === normalizedRequest) return path;
+    }
+
+    let best: { path: string; score: number } | null = null;
+    for (const path of candidates) {
+      const normalizedPath = normalizePath(path);
+      if (normalizedPath.endsWith(normalizedRequest)) {
+        const score = 1000 - normalizedPath.length;
+        if (!best || score > best.score) best = { path, score };
+        continue;
+      }
+
+      const requestSegments = normalizedRequest.split('/').filter(Boolean);
+      const pathSegments = normalizedPath.split('/');
+      let matchScore = 0;
+      let lastMatchIdx = -1;
+
+      for (const segment of requestSegments) {
+        const idx = pathSegments.findIndex((part, i) => i > lastMatchIdx && part.includes(segment));
+        if (idx > lastMatchIdx) {
+          matchScore += 10;
+          lastMatchIdx = idx;
+        }
+      }
+
+      if (matchScore >= requestSegments.length * 5) {
+        if (!best || matchScore > best.score) best = { path, score: matchScore };
+      }
+    }
+
+    return best?.path ?? null;
+  };
+  const getFileContent = async (filePath: string): Promise<string | null> => {
+    if (fileContents.has(filePath)) {
+      return fileContents.get(filePath) ?? '';
+    }
+    if (!fileAccess.readFile) return null;
+    const content = await fileAccess.readFile(filePath);
+    if (typeof content === 'string') {
+      fileContents.set(filePath, content);
+      return content;
+    }
+    return null;
+  };
 
   // ============================================================================
   // TOOL 1: SEARCH (Hybrid + 1-hop expansion)
@@ -80,6 +160,104 @@ export const createGraphRAGTools = (
       };
       
       const results: ResultInfo[] = [];
+      const nodeIds = searchResults
+        .slice(0, k)
+        .map(r => r.nodeId || r.id || '')
+        .filter((nodeId): nodeId is string => typeof nodeId === 'string' && nodeId.length > 0);
+
+      const outgoingByNode = new Map<string, any[]>();
+      const incomingByNode = new Map<string, any[]>();
+      const clusterByNode = new Map<string, string>();
+      const processesByNode = new Map<string, ProcessInfo[]>();
+
+      if (nodeIds.length > 0) {
+        const nodeIdList = toCypherStringList(nodeIds);
+
+        try {
+          const outgoingRows = await executeQuery(`
+            MATCH (n)-[r:CodeRelation]->(dst)
+            WHERE n.id IN ${nodeIdList} AND r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
+            RETURN n.id AS nodeId, dst.name AS name, r.type AS type, r.confidence AS confidence
+          `);
+          for (const row of outgoingRows) {
+            const nodeId = Array.isArray(row) ? row[0] : row.nodeId;
+            if (!nodeId) continue;
+            const list = outgoingByNode.get(nodeId) ?? [];
+            list.push({
+              name: Array.isArray(row) ? row[1] : row.name,
+              type: Array.isArray(row) ? row[2] : row.type,
+              confidence: Array.isArray(row) ? row[3] : row.confidence,
+            });
+            outgoingByNode.set(nodeId, list);
+          }
+        } catch {
+          // Skip outgoing edge lookup if query fails
+        }
+
+        try {
+          const incomingRows = await executeQuery(`
+            MATCH (src)-[r:CodeRelation]->(n)
+            WHERE n.id IN ${nodeIdList} AND r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS']
+            RETURN n.id AS nodeId, src.name AS name, r.type AS type, r.confidence AS confidence
+          `);
+          for (const row of incomingRows) {
+            const nodeId = Array.isArray(row) ? row[0] : row.nodeId;
+            if (!nodeId) continue;
+            const list = incomingByNode.get(nodeId) ?? [];
+            list.push({
+              name: Array.isArray(row) ? row[1] : row.name,
+              type: Array.isArray(row) ? row[2] : row.type,
+              confidence: Array.isArray(row) ? row[3] : row.confidence,
+            });
+            incomingByNode.set(nodeId, list);
+          }
+        } catch {
+          // Skip incoming edge lookup if query fails
+        }
+
+        try {
+          const clusterRows = await executeQuery(`
+            MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
+            WHERE n.id IN ${nodeIdList}
+            RETURN n.id AS nodeId, c.heuristicLabel AS label, c.cohesion AS cohesion
+            ORDER BY c.cohesion DESC
+          `);
+          for (const row of clusterRows) {
+            const nodeId = Array.isArray(row) ? row[0] : row.nodeId;
+            if (!nodeId || clusterByNode.has(nodeId)) continue;
+            const label = Array.isArray(row) ? row[1] : row.label;
+            if (label) clusterByNode.set(nodeId, label);
+          }
+        } catch {
+          // Skip cluster lookup if query fails
+        }
+
+        try {
+          const processRows = await executeQuery(`
+            MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
+            WHERE n.id IN ${nodeIdList}
+            RETURN n.id AS nodeId, p.id AS id, p.label AS label, r.step AS step, p.stepCount AS stepCount
+            ORDER BY r.step
+          `);
+          for (const row of processRows) {
+            const nodeId = Array.isArray(row) ? row[0] : row.nodeId;
+            if (!nodeId) continue;
+            const list = processesByNode.get(nodeId) ?? [];
+            const id = Array.isArray(row) ? row[1] : row.id;
+            const label = Array.isArray(row) ? row[2] : row.label;
+            if (!id || !label) continue;
+            list.push({
+              id,
+              label,
+              step: Array.isArray(row) ? row[3] : row.step,
+              stepCount: Array.isArray(row) ? row[4] : row.stepCount,
+            });
+            processesByNode.set(nodeId, list);
+          }
+        } catch {
+          // Skip process lookup if query fails
+        }
+      }
       
       for (let i = 0; i < Math.min(searchResults.length, k); i++) {
         const r = searchResults[i];
@@ -90,94 +268,23 @@ export const createGraphRAGTools = (
         const location = r.startLine ? ` (lines ${r.startLine}-${r.endLine})` : '';
         const sources = r.sources?.join('+') || 'hybrid';
         const score = r.score ? ` [score: ${r.score.toFixed(2)}]` : '';
-        
-        // Get 1-hop connections using single CodeRelation table
-        let connections = '';
-        if (nodeId) {
-          try {
-            const nodeLabel = nodeId.split(':')[0];
-            const connectionsQuery = `
-              MATCH (n:${nodeLabel} {id: '${nodeId.replace(/'/g, "''")}'})
-              OPTIONAL MATCH (n)-[r1:CodeRelation]->(dst)
-              OPTIONAL MATCH (src)-[r2:CodeRelation]->(n)
-              RETURN 
-                collect(DISTINCT {name: dst.name, type: r1.type, confidence: r1.confidence}) AS outgoing,
-                collect(DISTINCT {name: src.name, type: r2.type, confidence: r2.confidence}) AS incoming
-              LIMIT 1
-            `;
-            const connRes = await executeQuery(connectionsQuery);
-            if (connRes.length > 0) {
-              const row = connRes[0];
-              const rawOutgoing = Array.isArray(row) ? row[0] : (row.outgoing || []);
-              const rawIncoming = Array.isArray(row) ? row[1] : (row.incoming || []);
-              const outgoing = (rawOutgoing || []).filter((c: any) => c && c.name).slice(0, 3);
-              const incoming = (rawIncoming || []).filter((c: any) => c && c.name).slice(0, 3);
-              
-              const fmt = (c: any, dir: 'out' | 'in') => {
-                const conf = c.confidence ? Math.round(c.confidence * 100) : 100;
-                return dir === 'out' 
-                  ? `-[${c.type} ${conf}%]-> ${c.name}`
-                  : `<-[${c.type} ${conf}%]- ${c.name}`;
-              };
-              
-              const outList = outgoing.map((c: any) => fmt(c, 'out'));
-              const inList = incoming.map((c: any) => fmt(c, 'in'));
-              if (outList.length || inList.length) {
-                connections = `\n    Connections: ${[...outList, ...inList].join(', ')}`;
-              }
-            }
-          } catch {
-            // Skip connections if query fails
-          }
-        }
-        
-        // Cluster membership
-        let clusterLabel = 'Unclustered';
-        if (nodeId) {
-          try {
-            const nodeLabel = nodeId.split(':')[0];
-            const clusterQuery = `
-              MATCH (n:${nodeLabel} {id: '${nodeId.replace(/'/g, "''")}'})
-              MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
-              RETURN c.label AS label
-              LIMIT 1
-            `;
-            const clusterRes = await executeQuery(clusterQuery);
-            if (clusterRes.length > 0) {
-              const row = clusterRes[0];
-              const labelValue = Array.isArray(row) ? row[0] : row.label;
-              if (labelValue) clusterLabel = labelValue;
-            }
-          } catch {
-            // Skip cluster lookup if query fails
-          }
-        }
-        
-        // Process participation
-        const processes: ProcessInfo[] = [];
-        if (nodeId) {
-          try {
-            const nodeLabel = nodeId.split(':')[0];
-            const processQuery = `
-              MATCH (n:${nodeLabel} {id: '${nodeId.replace(/'/g, "''")}'})
-              MATCH (n)-[r:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
-              RETURN p.id AS id, p.label AS label, r.step AS step, p.stepCount AS stepCount
-              ORDER BY r.step
-            `;
-            const procRes = await executeQuery(processQuery);
-            for (const row of procRes) {
-              const id = Array.isArray(row) ? row[0] : row.id;
-              const labelValue = Array.isArray(row) ? row[1] : row.label;
-              const step = Array.isArray(row) ? row[2] : row.step;
-              const stepCount = Array.isArray(row) ? row[3] : row.stepCount;
-              if (id && labelValue) {
-                processes.push({ id, label: labelValue, step, stepCount });
-              }
-            }
-          } catch {
-            // Skip process lookup if query fails
-          }
-        }
+        const outgoing = (outgoingByNode.get(nodeId) ?? []).filter((c: any) => c && c.name).slice(0, 3);
+        const incoming = (incomingByNode.get(nodeId) ?? []).filter((c: any) => c && c.name).slice(0, 3);
+        const fmt = (c: any, dir: 'out' | 'in') => {
+          const conf = c.confidence ? Math.round(c.confidence * 100) : 100;
+          return dir === 'out'
+            ? `-[${c.type} ${conf}%]-> ${c.name}`
+            : `<-[${c.type} ${conf}%]- ${c.name}`;
+        };
+        const connectionParts = [
+          ...outgoing.map((c: any) => fmt(c, 'out')),
+          ...incoming.map((c: any) => fmt(c, 'in')),
+        ];
+        const connections = connectionParts.length > 0
+          ? `\n    Connections: ${connectionParts.join(', ')}`
+          : '';
+        const clusterLabel = clusterByNode.get(nodeId) || 'Unclustered';
+        const processes = processesByNode.get(nodeId) ?? [];
         
         results.push({
           idx: i + 1,
@@ -379,35 +486,39 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
       maxResults?: number;
     }) => {
       try {
-        const flags = caseSensitive ? 'g' : 'gi';
-        let regex: RegExp;
-        try {
-          regex = new RegExp(pattern, flags);
-        } catch (e) {
-          return `Invalid regex: ${pattern}. Error: ${e instanceof Error ? e.message : String(e)}`;
-        }
-        
-        const results: Array<{ file: string; line: number; content: string }> = [];
         const limit = maxResults ?? 100;
-        
-        for (const [filePath, content] of fileContents.entries()) {
-          if (fileFilter && !filePath.toLowerCase().includes(fileFilter.toLowerCase())) {
-            continue;
+        let results: Array<{ file: string; line: number; content: string }> = [];
+
+        if (fileAccess.grepFiles) {
+          results = await fileAccess.grepFiles({ pattern, fileFilter, caseSensitive, maxResults: limit });
+        } else {
+          const flags = caseSensitive ? 'g' : 'gi';
+          let regex: RegExp;
+          try {
+            regex = new RegExp(pattern, flags);
+          } catch (e) {
+            return `Invalid regex: ${pattern}. Error: ${e instanceof Error ? e.message : String(e)}`;
           }
-          
-          const lines = content.split('\n');
-          for (let i = 0; i < lines.length; i++) {
-            if (regex.test(lines[i])) {
-              results.push({
-                file: filePath,
-                line: i + 1,
-                content: lines[i].trim().slice(0, 150),
-              });
-              if (results.length >= limit) break;
+
+          for (const [filePath, content] of fileContents.entries()) {
+            if (fileFilter && !filePath.toLowerCase().includes(fileFilter.toLowerCase())) {
+              continue;
             }
-            regex.lastIndex = 0;
+
+            const lines = content.split('\n');
+            for (let i = 0; i < lines.length; i++) {
+              if (regex.test(lines[i])) {
+                results.push({
+                  file: filePath,
+                  line: i + 1,
+                  content: lines[i].trim().slice(0, 150),
+                });
+                if (results.length >= limit) break;
+              }
+              regex.lastIndex = 0;
+            }
+            if (results.length >= limit) break;
           }
-          if (results.length >= limit) break;
         }
         
         if (results.length === 0) {
@@ -440,53 +551,12 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
   
   const readTool = tool(
     async ({ filePath }: { filePath: string }) => {
-      const normalizedRequest = filePath.replace(/\\/g, '/').toLowerCase();
+      const actualPath = resolvePath(filePath) ?? filePath;
+      const content = await getFileContent(actualPath);
       
-      // Try exact match first
-      let content = fileContents.get(filePath);
-      let actualPath = filePath;
-      
-      // Smart matching if not found
-      if (!content) {
-        const candidates: Array<{ path: string; score: number }> = [];
-        
-        for (const [path] of fileContents.entries()) {
-          const normalizedPath = path.toLowerCase();
-          
-          if (normalizedPath === normalizedRequest) {
-            candidates.push({ path, score: 1000 });
-          } else if (normalizedPath.endsWith(normalizedRequest)) {
-            candidates.push({ path, score: 100 + (200 - path.length) });
-          } else {
-            const requestSegments = normalizedRequest.split('/').filter(Boolean);
-            const pathSegments = normalizedPath.split('/');
-            let matchScore = 0;
-            let lastMatchIdx = -1;
-            
-            for (const seg of requestSegments) {
-              const idx = pathSegments.findIndex((s, i) => i > lastMatchIdx && s.includes(seg));
-              if (idx > lastMatchIdx) {
-                matchScore += 10;
-                lastMatchIdx = idx;
-              }
-            }
-            
-            if (matchScore >= requestSegments.length * 5) {
-              candidates.push({ path, score: matchScore });
-            }
-          }
-        }
-        
-        candidates.sort((a, b) => b.score - a.score);
-        if (candidates.length > 0) {
-          actualPath = candidates[0].path;
-          content = fileContents.get(actualPath);
-        }
-      }
-      
-      if (!content) {
+      if (content === null) {
         const fileName = filePath.split('/').pop()?.toLowerCase() || '';
-        const similar = Array.from(fileContents.keys())
+        const similar = getKnownFilePaths()
           .filter(p => p.toLowerCase().includes(fileName))
           .slice(0, 5);
         
@@ -1228,25 +1298,35 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
           const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
           const targetFileName = (targetFilePath || target).split('/').pop() || target;
           const baseName = targetFileName.replace(/\.[^/.]+$/, '');
-          const refRegex = new RegExp(`\\b${escapeRegex(baseName)}\\b`, 'g');
           const hints: Array<{ file: string; line: number; content: string }> = [];
           const hintLimit = 15;
-          
-          for (const [filePath, content] of fileContents.entries()) {
-            if (filePath === targetFilePath) continue;
-            const lines = content.split('\n');
-            for (let i = 0; i < lines.length; i++) {
-              if (refRegex.test(lines[i])) {
-                hints.push({
-                  file: filePath,
-                  line: i + 1,
-                  content: lines[i].trim().slice(0, 150),
-                });
-                if (hints.length >= hintLimit) break;
+
+          if (fileAccess.grepFiles) {
+            const grepHints = await fileAccess.grepFiles({
+              pattern: `\\b${escapeRegex(baseName)}\\b`,
+              caseSensitive: true,
+              maxResults: hintLimit,
+            });
+            hints.push(...grepHints.filter(h => h.file !== targetFilePath).slice(0, hintLimit));
+          } else {
+            const refRegex = new RegExp(`\\b${escapeRegex(baseName)}\\b`, 'g');
+
+            for (const [filePath, content] of fileContents.entries()) {
+              if (filePath === targetFilePath) continue;
+              const lines = content.split('\n');
+              for (let i = 0; i < lines.length; i++) {
+                if (refRegex.test(lines[i])) {
+                  hints.push({
+                    file: filePath,
+                    line: i + 1,
+                    content: lines[i].trim().slice(0, 150),
+                  });
+                  if (hints.length >= hintLimit) break;
+                }
+                refRegex.lastIndex = 0;
               }
-              refRegex.lastIndex = 0;
+              if (hints.length >= hintLimit) break;
             }
-            if (hints.length >= hintLimit) break;
           }
           
           if (hints.length > 0) {
@@ -1373,24 +1453,12 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
       };
       
       // Helper to get code snippet for a node (call site context)
-      const getCallSiteSnippet = (n: NodeInfo): string | null => {
+      const getCallSiteSnippet = async (n: NodeInfo): Promise<string | null> => {
         if (!n.filePath || !n.startLine) return null;
-        
-        // Find the file in fileContents (try multiple path formats)
-        let content: string | undefined;
-        const normalizedPath = n.filePath.replace(/\\/g, '/');
-        
-        for (const [path, c] of fileContents.entries()) {
-          const normalizedKey = path.replace(/\\/g, '/');
-          if (normalizedKey === normalizedPath || 
-              normalizedKey.endsWith(normalizedPath) || 
-              normalizedPath.endsWith(normalizedKey)) {
-            content = c;
-            break;
-          }
-        }
-        
-        if (!content) return null;
+
+        const actualPath = resolvePath(n.filePath) ?? n.filePath;
+        const content = await getFileContent(actualPath);
+        if (content === null) return null;
         
         const lines = content.split('\n');
         const lineIdx = n.startLine - 1;
@@ -1408,14 +1476,14 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
           ? `d=1 (Directly DEPEND ON ${target}):`
           : `d=1 (${target} USES these):`;
         lines.push(header);
-        depth1.slice(0, 15).forEach(n => {
+        for (const n of depth1.slice(0, 15)) {
           lines.push(formatNode(n));
           // Add call site snippet for d=1 results
-          const snippet = getCallSiteSnippet(n);
+          const snippet = await getCallSiteSnippet(n);
           if (snippet) {
             lines.push(`    ↳ "${snippet}"`);
           }
-        });
+        }
         if (depth1.length > 15) lines.push(`  ... +${depth1.length - 15} more`);
         lines.push(``);
       }

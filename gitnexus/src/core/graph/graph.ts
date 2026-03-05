@@ -3,17 +3,19 @@ import { GraphNode, GraphRelationship, KnowledgeGraph } from './types.js'
 export const createKnowledgeGraph = (): KnowledgeGraph => {
   const nodeMap = new Map<string, GraphNode>();
   const relationshipMap = new Map<string, GraphRelationship>();
+  const nodes: GraphNode[] = [];
+  const relationships: GraphRelationship[] = [];
 
   const addNode = (node: GraphNode) => {
-    if(!nodeMap.has(node.id)) {
-      nodeMap.set(node.id, node);
-    }
+    if (nodeMap.has(node.id)) return;
+    nodeMap.set(node.id, node);
+    nodes.push(node);
   };
 
   const addRelationship = (relationship: GraphRelationship) => {
-    if (!relationshipMap.has(relationship.id)) {
-      relationshipMap.set(relationship.id, relationship);
-    }
+    if (relationshipMap.has(relationship.id)) return;
+    relationshipMap.set(relationship.id, relationship);
+    relationships.push(relationship);
   };
 
   /**
@@ -23,11 +25,15 @@ export const createKnowledgeGraph = (): KnowledgeGraph => {
     if (!nodeMap.has(nodeId)) return false;
     
     nodeMap.delete(nodeId);
+    const nodeIdx = nodes.findIndex(node => node.id === nodeId);
+    if (nodeIdx !== -1) nodes.splice(nodeIdx, 1);
     
     // Remove all relationships involving this node
-    for (const [relId, rel] of relationshipMap) {
+    for (let i = relationships.length - 1; i >= 0; i--) {
+      const rel = relationships[i];
       if (rel.sourceId === nodeId || rel.targetId === nodeId) {
-        relationshipMap.delete(relId);
+        relationshipMap.delete(rel.id);
+        relationships.splice(i, 1);
       }
     }
     return true;
@@ -48,13 +54,8 @@ export const createKnowledgeGraph = (): KnowledgeGraph => {
   };
 
   return{
-    get nodes(){
-      return Array.from(nodeMap.values())
-    },
-
-    get relationships(){
-      return Array.from(relationshipMap.values())
-    },
+    nodes,
+    relationships,
 
     iterNodes: () => nodeMap.values(),
     iterRelationships: () => relationshipMap.values(),
@@ -64,11 +65,11 @@ export const createKnowledgeGraph = (): KnowledgeGraph => {
 
     // O(1) count getters - avoid creating arrays just for length
     get nodeCount() {
-      return nodeMap.size;
+      return nodes.length;
     },
 
     get relationshipCount() {
-      return relationshipMap.size;
+      return relationships.length;
     },
 
     addNode,

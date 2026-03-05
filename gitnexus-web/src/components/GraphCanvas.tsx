@@ -53,7 +53,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
 
   const handleNodeClick = useCallback((nodeId: string) => {
     if (!graph) return;
-    const node = graph.nodes.find(n => n.id === nodeId);
+    const node = graph.getNode(nodeId);
     if (node) {
       setSelectedNode(node);
       openCodePanel();
@@ -65,7 +65,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
       setHoveredNodeName(null);
       return;
     }
-    const node = graph.nodes.find(n => n.id === nodeId);
+    const node = graph.getNode(nodeId);
     if (node) {
       setHoveredNodeName(node.properties.name);
     }
@@ -103,7 +103,7 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     focusNode: (nodeId: string) => {
       // Also update app state so the selection syncs properly
       if (graph) {
-        const node = graph.nodes.find(n => n.id === nodeId);
+        const node = graph.getNode(nodeId);
         if (node) {
           setSelectedNode(node);
           openCodePanel();
@@ -123,8 +123,8 @@ export const GraphCanvas = forwardRef<GraphCanvasHandle>((_, ref) => {
     graph.relationships.forEach(rel => {
       if (rel.type === 'MEMBER_OF') {
         // Find the community node to get its index
-        const communityNode = graph.nodes.find(n => n.id === rel.targetId && n.label === 'Community');
-        if (communityNode) {
+        const communityNode = graph.getNode(rel.targetId);
+        if (communityNode?.label === 'Community') {
           // Extract community index from id (e.g., "comm_5" -> 5)
           const communityIdx = parseInt(rel.targetId.replace('comm_', ''), 10) || 0;
           communityMemberships.set(rel.sourceId, communityIdx);

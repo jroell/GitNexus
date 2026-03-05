@@ -12,8 +12,10 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs/promises';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { loadMeta, listRegisteredRepos } from '../storage/repo-manager.js';
-import { executeQuery, closeKuzu, withKuzuDb } from '../core/kuzu/kuzu-adapter.js';
+import { closeKuzu } from '../core/kuzu/kuzu-adapter.js';
 import { NODE_TABLES } from '../core/kuzu/schema.js';
 import { GraphNode, GraphRelationship } from '../core/graph/types.js';
 import { searchFTSFromKuzu } from '../core/search/bm25-index.js';
@@ -21,9 +23,14 @@ import { hybridSearch } from '../core/search/hybrid-search.js';
 // Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
 // at server startup — crashes on unsupported Node ABI versions (#89)
 import { LocalBackend } from '../mcp/local/local-backend.js';
+import { initKuzu as initPooledKuzu, executeQuery as executePooledQuery } from '../mcp/core/kuzu-adapter.js';
 import { mountMCPEndpoints } from './mcp-http.js';
 
-const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> => {
+const execFileAsync = promisify(execFile);
+
+const buildGraph = async (
+  execute: (cypher: string) => Promise<any[]>,
+): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> => {
   const nodes: GraphNode[] = [];
   for (const table of NODE_TABLES) {
     try {
@@ -37,10 +44,12 @@ const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphR
       } else if (table === 'Process') {
         query = `MATCH (n:Process) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.processType AS processType, n.stepCount AS stepCount, n.communities AS communities, n.entryPointId AS entryPointId, n.terminalId AS terminalId`;
       } else {
-        query = `MATCH (n:${table}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.content AS content`;
+        // Symbol payloads omit source text. The UI only needs full content on File nodes,
+        // and dropping duplicate symbol snippets keeps remote graph downloads much smaller.
+        query = `MATCH (n:${table}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine`;
       }
 
-      const rows = await executeQuery(query);
+      const rows = await execute(query);
       for (const row of rows) {
         nodes.push({
           id: row.id ?? row[0],
@@ -68,7 +77,7 @@ const buildGraph = async (): Promise<{ nodes: GraphNode[]; relationships: GraphR
   }
 
   const relationships: GraphRelationship[] = [];
-  const relRows = await executeQuery(
+  const relRows = await execute(
     `MATCH (a)-[r:CodeRelation]->(b) RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence, r.reason AS reason, r.step AS step`
   );
   for (const row of relRows) {
@@ -138,6 +147,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     return repos[0]; // default to first
   };
 
+  const getPooledExecutor = async (entry: NonNullable<Awaited<ReturnType<typeof resolveRepo>>>) => {
+    const kuzuPath = path.join(entry.storagePath, 'kuzu');
+    const repoId = `${entry.name}:${entry.path}`;
+    await initPooledKuzu(repoId, kuzuPath);
+    return {
+      repoId,
+      execute: (cypher: string) => executePooledQuery(repoId, cypher),
+    };
+  };
+
   // List all registered repos
   app.get('/api/repos', async (_req, res) => {
     try {
@@ -179,8 +198,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
-      const kuzuPath = path.join(entry.storagePath, 'kuzu');
-      const graph = await withKuzuDb(kuzuPath, async () => buildGraph());
+      const { execute } = await getPooledExecutor(entry);
+      const graph = await buildGraph(execute);
       res.json(graph);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to build graph' });
@@ -201,8 +220,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
-      const kuzuPath = path.join(entry.storagePath, 'kuzu');
-      const result = await withKuzuDb(kuzuPath, () => executeQuery(cypher));
+      const { execute } = await getPooledExecutor(entry);
+      const result = await execute(cypher);
       res.json({ result });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Query failed' });
@@ -223,21 +242,21 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
-      const kuzuPath = path.join(entry.storagePath, 'kuzu');
       const parsedLimit = Number(req.body.limit ?? 10);
       const limit = Number.isFinite(parsedLimit)
         ? Math.max(1, Math.min(100, Math.trunc(parsedLimit)))
         : 10;
 
-      const results = await withKuzuDb(kuzuPath, async () => {
+      const { repoId, execute } = await getPooledExecutor(entry);
+      const results = await (async () => {
         const { isEmbedderReady } = await import('../core/embeddings/embedder.js');
         if (isEmbedderReady()) {
           const { semanticSearch } = await import('../core/embeddings/embedding-pipeline.js');
-          return hybridSearch(query, limit, executeQuery, semanticSearch);
+          return hybridSearch(query, limit, execute, semanticSearch, repoId);
         }
         // FTS-only fallback when embeddings aren't loaded
-        return searchFTSFromKuzu(query, limit);
-      });
+        return searchFTSFromKuzu(query, limit, repoId);
+      })();
       res.json({ results });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Search failed' });
@@ -274,6 +293,76 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       } else {
         res.status(500).json({ error: err.message || 'Failed to read file' });
       }
+    }
+  });
+
+  // Grep files in a repo using ripgrep so backend mode can do exact-text search lazily
+  app.post('/api/grep', async (req, res) => {
+    try {
+      const entry = await resolveRepo(requestedRepo(req));
+      if (!entry) {
+        res.status(404).json({ error: 'Repository not found' });
+        return;
+      }
+
+      const pattern = String(req.body.pattern ?? '').trim();
+      if (!pattern) {
+        res.status(400).json({ error: 'Missing "pattern" in request body' });
+        return;
+      }
+
+      const fileFilter = typeof req.body.fileFilter === 'string'
+        ? req.body.fileFilter.trim().toLowerCase()
+        : '';
+      const caseSensitive = req.body.caseSensitive === true;
+      const parsedLimit = Number(req.body.maxResults ?? 100);
+      const limit = Number.isFinite(parsedLimit)
+        ? Math.max(1, Math.min(500, Math.trunc(parsedLimit)))
+        : 100;
+
+      const rgArgs = ['-n', '--color', 'never', '--no-heading'];
+      if (!caseSensitive) rgArgs.push('-i');
+      rgArgs.push(pattern, '.');
+
+      let stdout = '';
+      try {
+        const result = await execFileAsync('rg', rgArgs, {
+          cwd: entry.path,
+          encoding: 'utf-8',
+          timeout: 10_000,
+          maxBuffer: 16 * 1024 * 1024,
+        });
+        stdout = result.stdout;
+      } catch (err: any) {
+        if (err?.code === 1) {
+          res.json({ results: [] });
+          return;
+        }
+        if (err?.code === 'ENOENT') {
+          res.status(500).json({ error: 'ripgrep (rg) is not installed on the server host' });
+          return;
+        }
+        throw err;
+      }
+
+      const results: Array<{ file: string; line: number; content: string }> = [];
+      for (const line of stdout.split('\n')) {
+        if (!line) continue;
+        const match = line.match(/^([^:]+):(\d+):(.*)$/);
+        if (!match) continue;
+        const [, file, lineNumber, content] = match;
+        if (fileFilter && !file.toLowerCase().includes(fileFilter)) continue;
+        results.push({
+          file: file.replace(/\\/g, '/').replace(/^\.\//, ''),
+          line: Number.parseInt(lineNumber, 10),
+          content: content.trim().slice(0, 150),
+        });
+        if (results.length >= limit) break;
+      }
+
+      res.json({ results });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Grep failed' });
     }
   });
 

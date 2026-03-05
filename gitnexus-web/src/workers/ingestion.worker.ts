@@ -39,13 +39,16 @@ const getKuzuAdapter = async () => {
 let embeddingProgress: EmbeddingProgress | null = null;
 let isEmbeddingComplete = false;
 
-// File contents state - stores full file contents for grep/read tools
+// File contents state - stores full file contents or backend-fetched cache for grep/read tools
 let storedFileContents: Map<string, string> = new Map();
+let storedKnownFilePaths: string[] = [];
 
 // Agent state
 let currentAgent: ReturnType<typeof createGraphRAGAgent> | null = null;
 let currentProviderConfig: ProviderConfig | null = null;
 let currentGraphResult: PipelineResult | null = null;
+let localCodebaseContextCache: { key: string; context: CodebaseContext } | null = null;
+const backendCodebaseContextCache = new Map<string, CodebaseContext>();
 
 // Pending enrichment config (for background processing)
 let pendingEnrichmentConfig: ProviderConfig | null = null;
@@ -108,6 +111,21 @@ const createHttpHybridSearch = (backendUrl: string, repo: string) => {
       const body = await response.json();
       const data = body.results ?? body;
 
+      if (Array.isArray(data)) {
+        return data.slice(0, k).map((item: any, i: number) => ({
+          nodeId: item.nodeId ?? item.id,
+          id: item.id ?? item.nodeId ?? item.filePath ?? `result-${i}`,
+          name: item.name ?? item.filePath?.split('/').pop() ?? 'Unknown',
+          label: item.label ?? item.type ?? 'File',
+          filePath: item.filePath ?? '',
+          startLine: item.startLine,
+          endLine: item.endLine,
+          content: item.content ?? '',
+          sources: item.sources ?? ['hybrid'],
+          score: item.score ?? (typeof item.distance === 'number' ? 1 - item.distance : undefined),
+        }));
+      }
+
       // Flatten process_symbols + definitions into a single ranked list
       const symbols: any[] = (data.process_symbols ?? []).map((s: any, i: number) => ({
         nodeId: s.id,
@@ -139,6 +157,43 @@ const createHttpHybridSearch = (backendUrl: string, repo: string) => {
   };
 };
 
+const createHttpReadFile = (backendUrl: string, repo: string) => {
+  return async (filePath: string): Promise<string | null> => {
+    try {
+      const response = await httpFetchWithTimeout(
+        `${backendUrl}/api/file?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(filePath)}`,
+      );
+      if (!response.ok) return null;
+      const body = await response.json();
+      return typeof body.content === 'string' ? body.content : null;
+    } catch {
+      return null;
+    }
+  };
+};
+
+const createHttpGrep = (backendUrl: string, repo: string) => {
+  return async (params: {
+    pattern: string;
+    fileFilter?: string;
+    caseSensitive?: boolean;
+    maxResults?: number;
+  }): Promise<Array<{ file: string; line: number; content: string }>> => {
+    try {
+      const response = await httpFetchWithTimeout(`${backendUrl}/api/grep`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...params, repo }),
+      });
+      if (!response.ok) return [];
+      const body = await response.json();
+      return Array.isArray(body.results) ? body.results : [];
+    } catch {
+      return [];
+    }
+  };
+};
+
 /**
  * Worker API exposed via Comlink
  * 
@@ -162,9 +217,11 @@ const workerApi = {
     // Run the actual pipeline
     const result = await runIngestionPipeline(file, onProgress);
     currentGraphResult = result;
+    localCodebaseContextCache = null;
     
     // Store file contents for grep/read tools (full content, not truncated)
     storedFileContents = result.fileContents;
+    storedKnownFilePaths = Array.from(result.fileContents.keys());
     
     // Build BM25 index for keyword search (instant, ~100ms)
     const bm25DocCount = buildBM25Index(storedFileContents);
@@ -266,9 +323,11 @@ const workerApi = {
     // Run the pipeline
     const result = await runPipelineFromFiles(files, onProgress);
     currentGraphResult = result;
+    localCodebaseContextCache = null;
     
     // Store file contents for grep/read tools (full content, not truncated)
     storedFileContents = result.fileContents;
+    storedKnownFilePaths = Array.from(result.fileContents.keys());
     
     // Build BM25 index for keyword search (instant, ~100ms)
     const bm25DocCount = buildBM25Index(storedFileContents);
@@ -586,7 +645,13 @@ const workerApi = {
       
       let codebaseContext;
       try {
-        codebaseContext = await buildCodebaseContext(kuzu.executeQuery, resolvedProjectName);
+        const cacheKey = `${resolvedProjectName}:${currentGraphResult?.graph.nodeCount ?? 0}:${currentGraphResult?.graph.relationshipCount ?? 0}`;
+        if (localCodebaseContextCache?.key === cacheKey) {
+          codebaseContext = localCodebaseContextCache.context;
+        } else {
+          codebaseContext = await buildCodebaseContext(kuzu.executeQuery, resolvedProjectName);
+          localCodebaseContextCache = { key: cacheKey, context: codebaseContext };
+        }
         if (import.meta.env.DEV) {
           console.log('📊 Codebase context built:', {
             files: codebaseContext.stats.fileCount,
@@ -607,6 +672,7 @@ const workerApi = {
         () => isEmbeddingComplete,
         () => isBM25Ready(),
         storedFileContents,
+        undefined,
         codebaseContext
       );
       currentProviderConfig = config;
@@ -631,29 +697,35 @@ const workerApi = {
    * @param config - Provider configuration for the LLM
    * @param backendUrl - Base URL of the gitnexus serve backend
    * @param repoName - Repository name on the backend
-   * @param fileContentsEntries - File contents as [path, content][] (Comlink can't transfer Maps)
+   * @param filePaths - Known repository file paths for fuzzy path matching
    * @param projectName - Display name for the project
    */
   async initializeBackendAgent(
     config: ProviderConfig,
     backendUrl: string,
     repoName: string,
-    fileContentsEntries: [string, string][],
+    filePaths: string[],
     projectName?: string,
   ): Promise<{ success: boolean; error?: string }> {
     try {
-      // Rebuild Map from serializable entries (Comlink can't transfer Maps)
-      const contents = new Map<string, string>(fileContentsEntries);
-      storedFileContents = contents;
+      storedFileContents = new Map();
+      storedKnownFilePaths = Array.from(new Set(filePaths));
 
       // Create HTTP-based tool wrappers
       const executeQuery = createHttpExecuteQuery(backendUrl, repoName);
       const hybridSearch = createHttpHybridSearch(backendUrl, repoName);
+      const readFile = createHttpReadFile(backendUrl, repoName);
+      const grepFiles = createHttpGrep(backendUrl, repoName);
 
       // Build codebase context (uses Cypher queries — works via HTTP)
       let codebaseContext: CodebaseContext | undefined;
       try {
-        codebaseContext = await buildCodebaseContext(executeQuery, projectName || repoName);
+        const cacheKey = `${backendUrl}|${repoName}|${projectName || repoName}`;
+        codebaseContext = backendCodebaseContextCache.get(cacheKey);
+        if (!codebaseContext) {
+          codebaseContext = await buildCodebaseContext(executeQuery, projectName || repoName);
+          backendCodebaseContextCache.set(cacheKey, codebaseContext);
+        }
       } catch {
         // Non-fatal — agent works without context
       }
@@ -670,7 +742,12 @@ const workerApi = {
         hybridSearch,          // hybridSearch → server hybrid search
         () => false,           // isEmbeddingReady → no local embedder
         () => true,            // isBM25Ready → available via server
-        contents,              // fileContents Map
+        storedFileContents,    // fileContents cache
+        {
+          getKnownFilePaths: () => storedKnownFilePaths,
+          readFile,
+          grepFiles,
+        },
         codebaseContext,
       );
 
@@ -895,4 +972,3 @@ Comlink.expose(workerApi);
 
 // TypeScript type for the exposed API (used by the hook)
 export type IngestionWorkerApi = typeof workerApi;
-

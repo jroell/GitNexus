@@ -36,10 +36,14 @@ export const initEmbedder = async (): Promise<FeatureExtractionPipeline> => {
       
       console.error('GitNexus: Loading embedding model (first search may take a moment)...');
 
-      // Try GPU first (DirectML on Windows, CUDA on Linux), fall back to CPU
-      const isWindows = process.platform === 'win32';
-      const gpuDevice = isWindows ? 'dml' : 'cuda';
-      const devicesToTry: Array<'dml' | 'cuda' | 'cpu'> = [gpuDevice, 'cpu'];
+      // Prefer platform-appropriate accelerators only where they are realistic.
+      // macOS does not support CUDA/DirectML here, so skip the guaranteed failed probe.
+      const gpuDevice =
+        process.platform === 'win32' ? 'dml' :
+        process.platform === 'linux' ? 'cuda' :
+        'cpu';
+      const devicesToTry: Array<'dml' | 'cuda' | 'cpu'> =
+        gpuDevice === 'cpu' ? ['cpu'] : [gpuDevice, 'cpu'];
       
       for (const device of devicesToTry) {
         try {

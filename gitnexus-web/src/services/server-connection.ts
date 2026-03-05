@@ -30,8 +30,13 @@ export interface ServerRepoInfo {
 export interface ConnectToServerResult {
   nodes: GraphNode[];
   relationships: GraphRelationship[];
-  fileContents: Record<string, string>;
   repoInfo: ServerRepoInfo;
+}
+
+export interface ServerGrepMatch {
+  file: string;
+  line: number;
+  content: string;
 }
 
 export function normalizeServerUrl(input: string): string {
@@ -118,14 +123,40 @@ export async function fetchGraph(
   return JSON.parse(text);
 }
 
-export function extractFileContents(nodes: GraphNode[]): Record<string, string> {
-  const contents: Record<string, string> = {};
-  for (const node of nodes) {
-    if (node.label === 'File' && (node.properties as any).content) {
-      contents[node.properties.filePath] = (node.properties as any).content;
-    }
+export async function fetchFileContent(
+  baseUrl: string,
+  filePath: string,
+  repoName?: string,
+): Promise<string> {
+  const repoQuery = repoName ? `repo=${encodeURIComponent(repoName)}&` : '';
+  const response = await fetch(`${baseUrl}/file?${repoQuery}path=${encodeURIComponent(filePath)}`);
+  if (!response.ok) {
+    throw new Error(`Server returned ${response.status}: ${response.statusText}`);
   }
-  return contents;
+  const body = await response.json();
+  return body.content ?? '';
+}
+
+export async function grepFiles(
+  baseUrl: string,
+  params: {
+    pattern: string;
+    fileFilter?: string;
+    caseSensitive?: boolean;
+    maxResults?: number;
+  },
+  repoName?: string,
+): Promise<ServerGrepMatch[]> {
+  const response = await fetch(`${baseUrl}/grep`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...params, repo: repoName }),
+  });
+  if (!response.ok) {
+    throw new Error(`Server returned ${response.status}: ${response.statusText}`);
+  }
+  const body = await response.json();
+  return Array.isArray(body.results) ? body.results : [];
 }
 
 export async function connectToServer(
@@ -149,9 +180,6 @@ export async function connectToServer(
     repoName
   );
 
-  // Phase 3: Extract file contents
-  onProgress?.('extracting', 0, null);
-  const fileContents = extractFileContents(nodes);
-
-  return { nodes, relationships, fileContents, repoInfo };
+  onProgress?.('hydrating', 0, null);
+  return { nodes, relationships, repoInfo };
 }

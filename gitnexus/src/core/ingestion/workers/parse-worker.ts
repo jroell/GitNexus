@@ -1260,23 +1260,7 @@ const processFileGroup = (
 // Worker message handler — supports sub-batch streaming
 // ============================================================================
 
-/** Accumulated result across sub-batches */
-let accumulated: ParseWorkerResult = {
-  nodes: [], relationships: [], symbols: [],
-  imports: [], calls: [], heritage: [], routes: [], fileCount: 0,
-};
 let cumulativeProcessed = 0;
-
-const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
-  target.nodes.push(...src.nodes);
-  target.relationships.push(...src.relationships);
-  target.symbols.push(...src.symbols);
-  target.imports.push(...src.imports);
-  target.calls.push(...src.calls);
-  target.heritage.push(...src.heritage);
-  target.routes.push(...src.routes);
-  target.fileCount += src.fileCount;
-};
 
 parentPort!.on('message', (msg: any) => {
   try {
@@ -1286,18 +1270,16 @@ parentPort!.on('message', (msg: any) => {
         parentPort!.postMessage({ type: 'progress', filesProcessed: cumulativeProcessed + filesProcessed });
       });
       cumulativeProcessed += result.fileCount;
-      mergeResult(accumulated, result);
+      parentPort!.postMessage({ type: 'chunk-result', data: result });
       // Signal ready for next sub-batch
       parentPort!.postMessage({ type: 'sub-batch-done' });
       return;
     }
 
-    // Flush: send accumulated results
+    // Flush: reset counters now that the parent has already aggregated all sub-batches
     if (msg && msg.type === 'flush') {
-      parentPort!.postMessage({ type: 'result', data: accumulated });
-      // Reset for potential reuse
-      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], heritage: [], routes: [], fileCount: 0 };
       cumulativeProcessed = 0;
+      parentPort!.postMessage({ type: 'flush-done' });
       return;
     }
 

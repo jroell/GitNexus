@@ -57,35 +57,41 @@ export async function getCodebaseStats(
   projectName: string
 ): Promise<CodebaseStats> {
   try {
-    // Count each node type
-    const countQueries = [
-      { type: 'files', query: 'MATCH (n:File) RETURN COUNT(n) AS count' },
-      { type: 'functions', query: 'MATCH (n:Function) RETURN COUNT(n) AS count' },
-      { type: 'classes', query: 'MATCH (n:Class) RETURN COUNT(n) AS count' },
-      { type: 'interfaces', query: 'MATCH (n:Interface) RETURN COUNT(n) AS count' },
-      { type: 'methods', query: 'MATCH (n:Method) RETURN COUNT(n) AS count' },
-    ];
+    const result = await executeQuery(`
+      MATCH (f:File)
+      WITH COUNT(f) AS fileCount
+      MATCH (fn:Function)
+      WITH fileCount, COUNT(fn) AS functionCount
+      MATCH (c:Class)
+      WITH fileCount, functionCount, COUNT(c) AS classCount
+      MATCH (i:Interface)
+      WITH fileCount, functionCount, classCount, COUNT(i) AS interfaceCount
+      MATCH (m:Method)
+      RETURN fileCount, functionCount, classCount, interfaceCount, COUNT(m) AS methodCount
+    `);
 
-    const counts: Record<string, number> = {};
-    
-    for (const { type, query } of countQueries) {
-      try {
-        const result = await executeQuery(query);
-        // Handle both array and object result formats
-        const row = result[0];
-        counts[type] = Array.isArray(row) ? (row[0] ?? 0) : (row?.count ?? 0);
-      } catch {
-        counts[type] = 0;
-      }
-    }
+    const row = result[0];
+    const values = Array.isArray(row) ? {
+      fileCount: row[0] ?? 0,
+      functionCount: row[1] ?? 0,
+      classCount: row[2] ?? 0,
+      interfaceCount: row[3] ?? 0,
+      methodCount: row[4] ?? 0,
+    } : {
+      fileCount: row?.fileCount ?? 0,
+      functionCount: row?.functionCount ?? 0,
+      classCount: row?.classCount ?? 0,
+      interfaceCount: row?.interfaceCount ?? 0,
+      methodCount: row?.methodCount ?? 0,
+    };
 
     return {
       projectName,
-      fileCount: counts.files,
-      functionCount: counts.functions,
-      classCount: counts.classes,
-      interfaceCount: counts.interfaces,
-      methodCount: counts.methods,
+      fileCount: values.fileCount,
+      functionCount: values.functionCount,
+      classCount: values.classCount,
+      interfaceCount: values.interfaceCount,
+      methodCount: values.methodCount,
     };
   } catch (error) {
     console.error('Failed to get codebase stats:', error);
@@ -149,7 +155,7 @@ export async function getHotspots(
  */
 export async function getFolderTree(
   executeQuery: (cypher: string) => Promise<any[]>,
-  maxDepth: number = 10
+  maxDepth: number = 4
 ): Promise<string> {
   try {
     // Get all file paths
@@ -348,6 +354,12 @@ function countItems(tree: Map<string, any>): number {
   return count;
 }
 
+function truncateLines(text: string, maxLines: number): string {
+  const lines = text.split('\n');
+  if (lines.length <= maxLines) return text;
+  return [...lines.slice(0, maxLines), `... (${lines.length - maxLines} more lines)`].join('\n');
+}
+
 /**
  * Build complete codebase context
  */
@@ -359,7 +371,7 @@ export async function buildCodebaseContext(
   const [stats, hotspots, folderTree] = await Promise.all([
     getCodebaseStats(executeQuery, projectName),
     getHotspots(executeQuery),
-    getFolderTree(executeQuery),
+    getFolderTree(executeQuery, 4),
   ]);
 
   return {
@@ -403,7 +415,7 @@ export function formatContextForPrompt(context: CodebaseContext): string {
     lines.push('### 📁 STRUCTURE');
     lines.push('```');
     lines.push(stats.projectName + '/');
-    lines.push(folderTree);
+    lines.push(truncateLines(folderTree, 40));
     lines.push('```');
   }
   

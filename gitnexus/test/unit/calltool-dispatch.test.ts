@@ -25,6 +25,7 @@ vi.mock('../../src/storage/repo-manager.js', () => ({
 // Also mock the search modules to avoid loading onnxruntime
 vi.mock('../../src/core/search/bm25-index.js', () => ({
   searchFTSFromKuzu: vi.fn().mockResolvedValue([]),
+  searchFTSNodesFromKuzu: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock('../../src/mcp/core/embedder.js', () => ({

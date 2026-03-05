@@ -159,6 +159,13 @@ interface SwiftPackageConfig {
   targets: Map<string, string>;
 }
 
+export interface RepoImportConfig {
+  tsconfigPaths: TsconfigPaths | null;
+  goModule: GoModuleConfig | null;
+  composerConfig: ComposerConfig | null;
+  swiftPackageConfig: SwiftPackageConfig | null;
+}
+
 async function loadSwiftPackageConfig(repoRoot: string): Promise<SwiftPackageConfig | null> {
   // Swift imports are module-name based (e.g., `import SiuperModel`)
   // SPM convention: Sources/<TargetName>/ or Package/Sources/<TargetName>/
@@ -187,6 +194,31 @@ async function loadSwiftPackageConfig(repoRoot: string): Promise<SwiftPackageCon
     return { targets };
   }
   return null;
+}
+
+export async function loadRepoImportConfig(repoRoot: string): Promise<RepoImportConfig> {
+  if (!repoRoot) {
+    return {
+      tsconfigPaths: null,
+      goModule: null,
+      composerConfig: null,
+      swiftPackageConfig: null,
+    };
+  }
+
+  const [tsconfigPaths, goModule, composerConfig, swiftPackageConfig] = await Promise.all([
+    loadTsconfigPaths(repoRoot),
+    loadGoModulePath(repoRoot),
+    loadComposerConfig(repoRoot),
+    loadSwiftPackageConfig(repoRoot),
+  ]);
+
+  return {
+    tsconfigPaths,
+    goModule,
+    composerConfig,
+    swiftPackageConfig,
+  };
 }
 
 // ============================================================================
@@ -956,6 +988,7 @@ export const processImportsFromExtracted = async (
   onProgress?: (current: number, total: number) => void,
   repoRoot?: string,
   prebuiltCtx?: ImportResolutionContext,
+  preloadedConfig?: RepoImportConfig,
 ) => {
   const ctx = prebuiltCtx ?? buildImportResolutionContext(files.map(f => f.path));
   const { allFilePaths, allFileList, normalizedFileList, suffixIndex: index, resolveCache } = ctx;
@@ -964,10 +997,13 @@ export const processImportsFromExtracted = async (
   let totalImportsResolved = 0;
 
   const effectiveRoot = repoRoot || '';
-  const tsconfigPaths = await loadTsconfigPaths(effectiveRoot);
-  const goModule = await loadGoModulePath(effectiveRoot);
-  const composerConfig = await loadComposerConfig(effectiveRoot);
-  const swiftPackageConfig = await loadSwiftPackageConfig(effectiveRoot);
+  const repoConfig = preloadedConfig ?? await loadRepoImportConfig(effectiveRoot);
+  const {
+    tsconfigPaths,
+    goModule,
+    composerConfig,
+    swiftPackageConfig,
+  } = repoConfig;
 
   const addImportEdge = (filePath: string, resolvedPath: string) => {
     const sourceId = generateId('File', filePath);
@@ -1004,21 +1040,6 @@ export const processImportsFromExtracted = async (
 
   const totalFiles = importsByFile.size;
   let filesProcessed = 0;
-
-  // Pre-build a suffix index for O(1) suffix lookups instead of O(n) linear scans
-  const suffixIndex = new Map<string, string[]>();
-  for (let i = 0; i < normalizedFileList.length; i++) {
-    const normalized = normalizedFileList[i];
-    // Index by last path segment (filename) for fast suffix matching
-    const lastSlash = normalized.lastIndexOf('/');
-    const filename = lastSlash >= 0 ? normalized.substring(lastSlash + 1) : normalized;
-    let list = suffixIndex.get(filename);
-    if (!list) {
-      list = [];
-      suffixIndex.set(filename, list);
-    }
-    list.push(allFileList[i]);
-  }
 
   for (const [filePath, fileImports] of importsByFile) {
     filesProcessed++;

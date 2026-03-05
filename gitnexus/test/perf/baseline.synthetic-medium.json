@@ -1,0 +1,41 @@
+{
+  "scenario": {
+    "name": "synthetic-medium",
+    "moduleCount": 24,
+    "sharedUtilityCount": 4
+  },
+  "generatedAt": "2026-03-05T22:24:43.022Z",
+  "sampleCount": 3,
+  "environment": {
+    "node": "v25.2.1",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpuModel": "Apple M4 Max",
+    "cpuCount": 16,
+    "totalMemoryGb": 128
+  },
+  "stats": {
+    "files": 152,
+    "nodes": 350,
+    "edges": 586,
+    "communities": 96,
+    "processes": 0
+  },
+  "timings": {
+    "pipelineMs": 95.23,
+    "kuzuLoadMs": 480.02,
+    "ftsMs": 1287.13,
+    "indexTotalMs": 1876.22,
+    "queryColdMs": 31.31,
+    "queryWarmAvgMs": 6.08,
+    "contextMs": 6.55,
+    "cypherMs": 0.38
+  },
+  "budgets": {
+    "indexTotalMs": 2533,
+    "queryColdMs": 43,
+    "queryWarmAvgMs": 9,
+    "contextMs": 9,
+    "cypherMs": 1
+  }
+}

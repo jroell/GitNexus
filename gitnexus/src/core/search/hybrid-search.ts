@@ -153,10 +153,11 @@ export const hybridSearch = async (
   query: string,
   limit: number,
   executeQuery: (cypher: string) => Promise<any[]>,
-  semanticSearch: (executeQuery: (cypher: string) => Promise<any[]>, query: string, k?: number) => Promise<SemanticSearchResult[]>
+  semanticSearch: (executeQuery: (cypher: string) => Promise<any[]>, query: string, k?: number) => Promise<SemanticSearchResult[]>,
+  repoId?: string,
 ): Promise<HybridSearchResult[]> => {
   // Use KuzuDB FTS for always-fresh BM25 results
-  const bm25Results = await searchFTSFromKuzu(query, limit);
+  const bm25Results = await searchFTSFromKuzu(query, limit, repoId);
   const semanticResults = await semanticSearch(executeQuery, query, limit);
   return mergeWithRRF(bm25Results, semanticResults, limit);
 };

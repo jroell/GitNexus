@@ -1,7 +1,10 @@
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { createKnowledgeGraph } from '../graph/graph.js';
 import { processStructure } from './structure-processor.js';
 import { processParsing } from './parsing-processor.js';
-import { processImports, processImportsFromExtracted, createImportMap, buildImportResolutionContext } from './import-processor.js';
+import { processImports, processImportsFromExtracted, createImportMap, buildImportResolutionContext, loadRepoImportConfig } from './import-processor.js';
 import { processCalls, processCallsFromExtracted, processRoutesFromExtracted } from './call-processor.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { processCommunities } from './community-processor.js';
@@ -24,6 +27,23 @@ const CHUNK_BYTE_BUDGET = 20 * 1024 * 1024; // 20MB
 
 /** Max AST trees to keep in LRU cache */
 const AST_CACHE_CAP = 50;
+
+const resolveParseWorkerUrl = (): URL => {
+  const jsUrl = new URL('./workers/parse-worker.js', import.meta.url);
+  if (fs.existsSync(fileURLToPath(jsUrl))) {
+    return jsUrl;
+  }
+
+  if (process.env.GITNEXUS_PREFER_DIST_WORKERS === '1') {
+    const packageRoot = path.resolve(fileURLToPath(new URL('../../..', import.meta.url)));
+    const distWorkerPath = path.join(packageRoot, 'dist', 'core', 'ingestion', 'workers', 'parse-worker.js');
+    if (fs.existsSync(distWorkerPath)) {
+      return pathToFileURL(distWorkerPath);
+    }
+  }
+
+  throw new Error('parse-worker.js not found in src or dist');
+};
 
 export const runPipelineFromRepo = async (
   repoPath: string,
@@ -140,7 +160,7 @@ export const runPipelineFromRepo = async (
     // Create worker pool once, reuse across chunks
     let workerPool: WorkerPool | undefined;
     try {
-      const workerUrl = new URL('./workers/parse-worker.js', import.meta.url);
+      const workerUrl = resolveParseWorkerUrl();
       workerPool = createWorkerPool(workerUrl);
     } catch (err) {
       // Worker pool creation failed — sequential fallback
@@ -155,6 +175,7 @@ export const runPipelineFromRepo = async (
     // Build import resolution context once — suffix index, file lists, resolve cache.
     // Reused across all chunks to avoid rebuilding O(files × path_depth) structures.
     const importCtx = buildImportResolutionContext(allPaths);
+    const repoImportConfig = await loadRepoImportConfig(repoPath);
     const allPathObjects = allPaths.map(p => ({ path: p }));
 
     // Single-pass: parse + resolve imports/calls/heritage per chunk.
@@ -192,7 +213,7 @@ export const runPipelineFromRepo = async (
 
         if (chunkWorkerData) {
           // Imports
-          await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, importMap, undefined, repoPath, importCtx);
+          await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, importMap, undefined, repoPath, importCtx, repoImportConfig);
           // Calls — resolve immediately, then free the array
           if (chunkWorkerData.calls.length > 0) {
             await processCallsFromExtracted(graph, chunkWorkerData.calls, symbolTable, importMap);

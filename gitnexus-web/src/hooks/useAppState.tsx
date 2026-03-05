@@ -2,7 +2,7 @@ import { createContext, useContext, useState, useCallback, useRef, useEffect, Re
 import * as Comlink from 'comlink';
 import { KnowledgeGraph, GraphNode, NodeLabel } from '../core/graph/types';
 import { PipelineProgress, PipelineResult, deserializePipelineResult } from '../types/pipeline';
-import { createKnowledgeGraph } from '../core/graph/graph';
+import { createKnowledgeGraphFromData } from '../core/graph/graph';
 import { DEFAULT_VISIBLE_LABELS } from '../lib/constants';
 import type { IngestionWorkerApi } from '../workers/ingestion.worker';
 import type { FileEntry } from '../services/zip';
@@ -12,7 +12,7 @@ import { loadSettings, getActiveProviderConfig, saveSettings } from '../core/llm
 import type { AgentMessage } from '../core/llm/agent';
 import { DEFAULT_VISIBLE_EDGES, type EdgeType } from '../lib/constants';
 import type { RepoSummary, ConnectToServerResult } from '../services/server-connection';
-import { fetchRepos, connectToServer } from '../services/server-connection';
+import { fetchRepos, connectToServer, fetchFileContent as fetchServerFileContent, normalizeServerUrl } from '../services/server-connection';
 
 export type ViewMode = 'onboarding' | 'loading' | 'exploring';
 export type RightPanelTab = 'code' | 'chat';
@@ -62,6 +62,8 @@ interface AppState {
   setGraph: (graph: KnowledgeGraph | null) => void;
   fileContents: Map<string, string>;
   setFileContents: (contents: Map<string, string>) => void;
+  resolveFilePath: (requestedPath: string) => string | null;
+  loadFileContent: (filePath: string) => Promise<string | null>;
 
   // Selection
   selectedNode: GraphNode | null;
@@ -172,6 +174,51 @@ interface AppState {
 }
 
 const AppStateContext = createContext<AppState | null>(null);
+
+const resolveBackendTargetFromState = (
+  serverBaseUrl: string | null,
+  projectName: string,
+  availableRepos: RepoSummary[],
+): { backendUrl: string; repoName: string } | null => {
+  let baseUrl = serverBaseUrl;
+
+  if (!baseUrl) {
+    try {
+      const fromSettings = localStorage.getItem('gitnexus-backend-url');
+      const fromDropZone = localStorage.getItem('gitnexus-server-url');
+      const candidate = (fromSettings || fromDropZone || '').trim();
+      if (candidate) {
+        baseUrl = normalizeServerUrl(candidate);
+      }
+    } catch {
+      // localStorage unavailable — ignore and fall back to local mode
+    }
+  }
+
+  if (!baseUrl) return null;
+
+  const backendUrl = baseUrl.replace(/\/+$/, '').replace(/\/api$/, '');
+
+  const project = (projectName || '').trim();
+  let repoName = project;
+
+  if (availableRepos.length > 0) {
+    const exact = availableRepos.find((repo) => repo.name === project);
+    if (exact) {
+      repoName = exact.name;
+    } else {
+      const byPathBasename = availableRepos.find((repo) => repo.path.split('/').pop() === project);
+      if (byPathBasename) {
+        repoName = byPathBasename.name;
+      } else if (!repoName && availableRepos.length === 1) {
+        repoName = availableRepos[0].name;
+      }
+    }
+  }
+
+  if (!repoName) return null;
+  return { backendUrl, repoName };
+};
 
 export const AppStateProvider = ({ children }: { children: ReactNode }) => {
   // View state
@@ -303,23 +350,55 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
   const [codeReferences, setCodeReferences] = useState<CodeReference[]>([]);
   const [isCodePanelOpen, setCodePanelOpen] = useState(false);
   const [codeReferenceFocus, setCodeReferenceFocus] = useState<CodeReferenceFocus | null>(null);
+  const pendingFileLoadsRef = useRef<Map<string, Promise<string | null>>>(new Map());
+  const failedFileLoadsRef = useRef<Set<string>>(new Set());
 
-    const normalizePath = useCallback((p: string) => {
+  useEffect(() => {
+    pendingFileLoadsRef.current.clear();
+    failedFileLoadsRef.current.clear();
+  }, [graph]);
+
+  const normalizePath = useCallback((p: string) => {
     return p.replace(/\\/g, '/').replace(/^\.?\//, '');
   }, []);
+
+  const getKnownFilePaths = useCallback((): string[] => {
+    const paths: string[] = [];
+    const seen = new Set<string>();
+
+    for (const key of fileContents.keys()) {
+      if (!seen.has(key)) {
+        seen.add(key);
+        paths.push(key);
+      }
+    }
+
+    if (graph) {
+      for (const node of graph.nodes) {
+        if (node.label !== 'File' || !node.properties.filePath) continue;
+        if (!seen.has(node.properties.filePath)) {
+          seen.add(node.properties.filePath);
+          paths.push(node.properties.filePath);
+        }
+      }
+    }
+
+    return paths;
+  }, [fileContents, graph]);
 
   const resolveFilePath = useCallback((requestedPath: string): string | null => {
     const req = normalizePath(requestedPath).toLowerCase();
     if (!req) return null;
+    const knownPaths = getKnownFilePaths();
 
     // Exact match first
-    for (const key of fileContents.keys()) {
+    for (const key of knownPaths) {
       if (normalizePath(key).toLowerCase() === req) return key;
     }
 
     // Ends-with match (best for partial paths like "src/foo.ts")
     let best: { path: string; score: number } | null = null;
-    for (const key of fileContents.keys()) {
+    for (const key of knownPaths) {
       const norm = normalizePath(key).toLowerCase();
       if (norm.endsWith(req)) {
         const score = 1000 - norm.length; // shorter is better
@@ -330,7 +409,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
 
     // Segment match fallback
     const segs = req.split('/').filter(Boolean);
-    for (const key of fileContents.keys()) {
+    for (const key of knownPaths) {
       const normSegs = normalizePath(key).toLowerCase().split('/').filter(Boolean);
       let idx = 0;
       for (const s of segs) {
@@ -342,7 +421,49 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     }
 
     return null;
-  }, [fileContents, normalizePath]);
+  }, [getKnownFilePaths, normalizePath]);
+
+  const loadFileContent = useCallback(async (requestedPath: string): Promise<string | null> => {
+    const actualPath = resolveFilePath(requestedPath) ?? requestedPath;
+    if (fileContents.has(actualPath)) {
+      return fileContents.get(actualPath) ?? '';
+    }
+    if (failedFileLoadsRef.current.has(actualPath)) {
+      return null;
+    }
+
+    const inFlight = pendingFileLoadsRef.current.get(actualPath);
+    if (inFlight) {
+      return inFlight;
+    }
+
+    const backendTarget = resolveBackendTargetFromState(serverBaseUrl, projectName, availableRepos);
+    if (!backendTarget) {
+      return null;
+    }
+
+    const request = fetchServerFileContent(
+      `${backendTarget.backendUrl}/api`,
+      actualPath,
+      backendTarget.repoName,
+    ).then((content) => {
+      setFileContents(prev => {
+        const next = new Map(prev);
+        next.set(actualPath, content);
+        return next;
+      });
+      failedFileLoadsRef.current.delete(actualPath);
+      return content;
+    }).catch(() => {
+      failedFileLoadsRef.current.add(actualPath);
+      return null;
+    }).finally(() => {
+      pendingFileLoadsRef.current.delete(actualPath);
+    });
+
+    pendingFileLoadsRef.current.set(actualPath, request);
+    return request;
+  }, [availableRepos, fileContents, projectName, resolveFilePath, serverBaseUrl]);
 
   const findFileNodeId = useCallback((filePath: string): string | undefined => {
     if (!graph) return undefined;
@@ -450,7 +571,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
 
     const proxiedOnProgress = Comlink.proxy(onProgress);
     const serializedResult = await api.runPipeline(file, proxiedOnProgress, clusteringConfig);
-    return deserializePipelineResult(serializedResult, createKnowledgeGraph);
+    return deserializePipelineResult(serializedResult, createKnowledgeGraphFromData);
   }, []);
 
   const runPipelineFromFiles = useCallback(async (
@@ -463,7 +584,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
 
     const proxiedOnProgress = Comlink.proxy(onProgress);
     const serializedResult = await api.runPipelineFromFiles(files, proxiedOnProgress, clusteringConfig);
-    return deserializePipelineResult(serializedResult, createKnowledgeGraph);
+    return deserializePipelineResult(serializedResult, createKnowledgeGraphFromData);
   }, []);
 
   const runQuery = useCallback(async (cypher: string): Promise<any[]> => {
@@ -565,6 +686,10 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     setLLMSettings(loadSettings());
   }, []);
 
+  const resolveBackendAgentTarget = useCallback((): { backendUrl: string; repoName: string } | null => {
+    return resolveBackendTargetFromState(serverBaseUrl, projectName, availableRepos);
+  }, [serverBaseUrl, projectName, availableRepos]);
+
   const initializeAgent = useCallback(async (overrideProjectName?: string): Promise<void> => {
     const api = apiRef.current;
     if (!api) {
@@ -584,7 +709,21 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     try {
       // Use override if provided (for fresh loads), fallback to state (for re-init)
       const effectiveProjectName = overrideProjectName || projectName || 'project';
-      const result = await api.initializeAgent(config, effectiveProjectName);
+      const backendTarget = resolveBackendAgentTarget();
+
+      const result = backendTarget
+        ? await api.initializeBackendAgent(
+            config,
+            backendTarget.backendUrl,
+            backendTarget.repoName,
+            graph?.nodes
+              .filter(node => node.label === 'File' && typeof node.properties.filePath === 'string')
+              .map(node => node.properties.filePath)
+              ?? [],
+            effectiveProjectName
+          )
+        : await api.initializeAgent(config, effectiveProjectName);
+
       if (result.success) {
         setIsAgentReady(true);
         setAgentError(null);
@@ -602,7 +741,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     } finally {
       setIsAgentInitializing(false);
     }
-  }, [projectName]);
+  }, [graph, projectName, resolveBackendAgentTarget]);
 
   const sendChatMessage = useCallback(async (message: string): Promise<void> => {
     const api = apiRef.current;
@@ -998,8 +1137,8 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
           const pct = total ? Math.round((downloaded / total) * 90) + 5 : 50;
           const mb = (downloaded / (1024 * 1024)).toFixed(1);
           setProgress({ phase: 'extracting', percent: pct, message: 'Downloading graph...', detail: `${mb} MB downloaded` });
-        } else if (phase === 'extracting') {
-          setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Extracting file contents' });
+        } else if (phase === 'hydrating') {
+          setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Hydrating graph indexes' });
         }
       }, undefined, repoName);
 
@@ -1008,16 +1147,11 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
       const pName = result.repoInfo.name || repoPath.split('/').pop() || 'server-project';
       setProjectName(pName);
 
-      const graph = createKnowledgeGraph();
-      for (const node of result.nodes) graph.addNode(node);
-      for (const rel of result.relationships) graph.addRelationship(rel);
-      setGraph(graph);
-
-      const fileMap = new Map<string, string>();
-      for (const [p, c] of Object.entries(result.fileContents)) fileMap.set(p, c);
-      setFileContents(fileMap);
+      setGraph(createKnowledgeGraphFromData(result.nodes, result.relationships));
+      setFileContents(new Map<string, string>());
 
       setViewMode('exploring');
+      setProgress(null);
 
       if (getActiveProviderConfig()) initializeAgent(pName);
 
@@ -1098,6 +1232,8 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     setGraph,
     fileContents,
     setFileContents,
+    resolveFilePath,
+    loadFileContent,
     selectedNode,
     setSelectedNode,
     isRightPanelOpen,
@@ -1194,4 +1330,3 @@ export const useAppState = (): AppState => {
   }
   return context;
 };
-
