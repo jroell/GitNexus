@@ -57,33 +57,23 @@ export async function getCodebaseStats(
   projectName: string
 ): Promise<CodebaseStats> {
   try {
-    const result = await executeQuery(`
-      MATCH (f:File)
-      WITH COUNT(f) AS fileCount
-      MATCH (fn:Function)
-      WITH fileCount, COUNT(fn) AS functionCount
-      MATCH (c:Class)
-      WITH fileCount, functionCount, COUNT(c) AS classCount
-      MATCH (i:Interface)
-      WITH fileCount, functionCount, classCount, COUNT(i) AS interfaceCount
-      MATCH (m:Method)
-      RETURN fileCount, functionCount, classCount, interfaceCount, COUNT(m) AS methodCount
-    `);
+    const countQueries = [
+      { key: 'fileCount', query: 'MATCH (n:File) RETURN COUNT(n) AS count' },
+      { key: 'functionCount', query: 'MATCH (n:Function) RETURN COUNT(n) AS count' },
+      { key: 'classCount', query: 'MATCH (n:Class) RETURN COUNT(n) AS count' },
+      { key: 'interfaceCount', query: 'MATCH (n:Interface) RETURN COUNT(n) AS count' },
+      { key: 'methodCount', query: 'MATCH (n:Method) RETURN COUNT(n) AS count' },
+    ] as const;
 
-    const row = result[0];
-    const values = Array.isArray(row) ? {
-      fileCount: row[0] ?? 0,
-      functionCount: row[1] ?? 0,
-      classCount: row[2] ?? 0,
-      interfaceCount: row[3] ?? 0,
-      methodCount: row[4] ?? 0,
-    } : {
-      fileCount: row?.fileCount ?? 0,
-      functionCount: row?.functionCount ?? 0,
-      classCount: row?.classCount ?? 0,
-      interfaceCount: row?.interfaceCount ?? 0,
-      methodCount: row?.methodCount ?? 0,
-    };
+    const entries = await Promise.all(
+      countQueries.map(async ({ key, query }) => {
+        const result = await executeQuery(query);
+        const row = result[0];
+        const count = Array.isArray(row) ? (row[0] ?? 0) : (row?.count ?? 0);
+        return [key, count] as const;
+      })
+    );
+    const values = Object.fromEntries(entries) as Record<(typeof countQueries)[number]['key'], number>;
 
     return {
       projectName,

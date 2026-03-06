@@ -31,6 +31,7 @@ export const Header = ({ onFocusNode, availableRepos = [], onSwitchRepo }: Heade
     openChatPanel,
     isRightPanelOpen,
     rightPanelTab,
+    serverRepoSelector,
     setSettingsPanelOpen,
   } = useAppState();
   const [isRepoDropdownOpen, setIsRepoDropdownOpen] = useState(false);
@@ -142,13 +143,15 @@ export const Header = ({ onFocusNode, availableRepos = [], onSwitchRepo }: Heade
             {isRepoDropdownOpen && availableRepos.length >= 2 && (
               <div className="absolute top-full left-0 mt-1 w-72 bg-surface border border-border-subtle rounded-lg shadow-xl overflow-hidden z-50">
                 {availableRepos.map((repo) => {
-                  const isCurrent = repo.name === projectName;
+                  const isCurrent = serverRepoSelector
+                    ? repo.path === serverRepoSelector
+                    : repo.name === projectName;
                   return (
                     <button
-                      key={repo.name}
+                      key={repo.path}
                       onClick={() => {
                         if (!isCurrent && onSwitchRepo) {
-                          onSwitchRepo(repo.name);
+                          onSwitchRepo(repo.path);
                         }
                         setIsRepoDropdownOpen(false);
                       }}
@@ -290,4 +293,3 @@ export const Header = ({ onFocusNode, availableRepos = [], onSwitchRepo }: Heade
     </header>
   );
 };
-

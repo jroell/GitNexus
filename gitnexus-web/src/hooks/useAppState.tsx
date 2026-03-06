@@ -12,7 +12,7 @@ import { loadSettings, getActiveProviderConfig, saveSettings } from '../core/llm
 import type { AgentMessage } from '../core/llm/agent';
 import { DEFAULT_VISIBLE_EDGES, type EdgeType } from '../lib/constants';
 import type { RepoSummary, ConnectToServerResult } from '../services/server-connection';
-import { fetchRepos, connectToServer, fetchFileContent as fetchServerFileContent, normalizeServerUrl } from '../services/server-connection';
+import { connectToServer, fetchFileContent as fetchServerFileContent } from '../services/server-connection';
 
 export type ViewMode = 'onboarding' | 'loading' | 'exploring';
 export type RightPanelTab = 'code' | 'chat';
@@ -50,6 +50,17 @@ export interface CodeReferenceFocus {
   startLine?: number;
   endLine?: number;
   ts: number;
+}
+
+interface BackendTarget {
+  backendUrl: string;
+  repoSelector: string;
+}
+
+interface InitializeAgentOptions {
+  backendTarget?: BackendTarget;
+  filePaths?: string[];
+  fileContentsEntries?: [string, string][];
 }
 
 interface AppState {
@@ -118,6 +129,8 @@ interface AppState {
   // Multi-repo switching
   serverBaseUrl: string | null;
   setServerBaseUrl: (url: string | null) => void;
+  serverRepoSelector: string | null;
+  setServerRepoSelector: (selector: string | null) => void;
   availableRepos: RepoSummary[];
   setAvailableRepos: (repos: RepoSummary[]) => void;
   switchRepo: (repoName: string) => Promise<void>;
@@ -157,7 +170,7 @@ interface AppState {
 
   // LLM methods
   refreshLLMSettings: () => void;
-  initializeAgent: (overrideProjectName?: string) => Promise<void>;
+  initializeAgent: (overrideProjectName?: string, options?: InitializeAgentOptions) => Promise<void>;
   sendChatMessage: (message: string) => Promise<void>;
   stopChatResponse: () => void;
   clearChat: () => void;
@@ -175,49 +188,46 @@ interface AppState {
 
 const AppStateContext = createContext<AppState | null>(null);
 
+const toBackendBaseUrl = (serverApiUrl: string): string =>
+  serverApiUrl.replace(/\/+$/, '').replace(/\/api$/, '');
+
+const getGraphFilePaths = (nodes: GraphNode[]): string[] =>
+  nodes
+    .filter(node => node.label === 'File' && typeof node.properties.filePath === 'string')
+    .map(node => node.properties.filePath);
+
 const resolveBackendTargetFromState = (
   serverBaseUrl: string | null,
+  serverRepoSelector: string | null,
   projectName: string,
   availableRepos: RepoSummary[],
-): { backendUrl: string; repoName: string } | null => {
-  let baseUrl = serverBaseUrl;
+): BackendTarget | null => {
+  if (!serverBaseUrl) return null;
 
-  if (!baseUrl) {
-    try {
-      const fromSettings = localStorage.getItem('gitnexus-backend-url');
-      const fromDropZone = localStorage.getItem('gitnexus-server-url');
-      const candidate = (fromSettings || fromDropZone || '').trim();
-      if (candidate) {
-        baseUrl = normalizeServerUrl(candidate);
-      }
-    } catch {
-      // localStorage unavailable — ignore and fall back to local mode
-    }
+  const backendUrl = toBackendBaseUrl(serverBaseUrl);
+  if (serverRepoSelector) {
+    return { backendUrl, repoSelector: serverRepoSelector };
   }
 
-  if (!baseUrl) return null;
-
-  const backendUrl = baseUrl.replace(/\/+$/, '').replace(/\/api$/, '');
-
   const project = (projectName || '').trim();
-  let repoName = project;
+  let repoSelector = project;
 
   if (availableRepos.length > 0) {
     const exact = availableRepos.find((repo) => repo.name === project);
     if (exact) {
-      repoName = exact.name;
+      repoSelector = exact.path;
     } else {
       const byPathBasename = availableRepos.find((repo) => repo.path.split('/').pop() === project);
       if (byPathBasename) {
-        repoName = byPathBasename.name;
-      } else if (!repoName && availableRepos.length === 1) {
-        repoName = availableRepos[0].name;
+        repoSelector = byPathBasename.path;
+      } else if (!repoSelector && availableRepos.length === 1) {
+        repoSelector = availableRepos[0].path;
       }
     }
   }
 
-  if (!repoName) return null;
-  return { backendUrl, repoName };
+  if (!repoSelector) return null;
+  return { backendUrl, repoSelector };
 };
 
 export const AppStateProvider = ({ children }: { children: ReactNode }) => {
@@ -328,6 +338,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
 
   // Multi-repo switching
   const [serverBaseUrl, setServerBaseUrl] = useState<string | null>(null);
+  const [serverRepoSelector, setServerRepoSelector] = useState<string | null>(null);
   const [availableRepos, setAvailableRepos] = useState<RepoSummary[]>([]);
 
   // Embedding state
@@ -437,7 +448,12 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
       return inFlight;
     }
 
-    const backendTarget = resolveBackendTargetFromState(serverBaseUrl, projectName, availableRepos);
+    const backendTarget = resolveBackendTargetFromState(
+      serverBaseUrl,
+      serverRepoSelector,
+      projectName,
+      availableRepos,
+    );
     if (!backendTarget) {
       return null;
     }
@@ -445,7 +461,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     const request = fetchServerFileContent(
       `${backendTarget.backendUrl}/api`,
       actualPath,
-      backendTarget.repoName,
+      backendTarget.repoSelector,
     ).then((content) => {
       setFileContents(prev => {
         const next = new Map(prev);
@@ -463,7 +479,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
 
     pendingFileLoadsRef.current.set(actualPath, request);
     return request;
-  }, [availableRepos, fileContents, projectName, resolveFilePath, serverBaseUrl]);
+  }, [availableRepos, fileContents, projectName, resolveFilePath, serverBaseUrl, serverRepoSelector]);
 
   const findFileNodeId = useCallback((filePath: string): string | undefined => {
     if (!graph) return undefined;
@@ -686,11 +702,14 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     setLLMSettings(loadSettings());
   }, []);
 
-  const resolveBackendAgentTarget = useCallback((): { backendUrl: string; repoName: string } | null => {
-    return resolveBackendTargetFromState(serverBaseUrl, projectName, availableRepos);
-  }, [serverBaseUrl, projectName, availableRepos]);
+  const resolveBackendAgentTarget = useCallback((): BackendTarget | null => {
+    return resolveBackendTargetFromState(serverBaseUrl, serverRepoSelector, projectName, availableRepos);
+  }, [serverBaseUrl, serverRepoSelector, projectName, availableRepos]);
 
-  const initializeAgent = useCallback(async (overrideProjectName?: string): Promise<void> => {
+  const initializeAgent = useCallback(async (
+    overrideProjectName?: string,
+    options?: InitializeAgentOptions,
+  ): Promise<void> => {
     const api = apiRef.current;
     if (!api) {
       setAgentError('Worker not initialized');
@@ -709,17 +728,17 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     try {
       // Use override if provided (for fresh loads), fallback to state (for re-init)
       const effectiveProjectName = overrideProjectName || projectName || 'project';
-      const backendTarget = resolveBackendAgentTarget();
+      const backendTarget = options?.backendTarget ?? resolveBackendAgentTarget();
+      const backendFilePaths = options?.filePaths ?? (graph ? getGraphFilePaths(graph.nodes) : []);
+      const backendFileContentsEntries = options?.fileContentsEntries ?? Array.from(fileContents.entries());
 
       const result = backendTarget
         ? await api.initializeBackendAgent(
             config,
             backendTarget.backendUrl,
-            backendTarget.repoName,
-            graph?.nodes
-              .filter(node => node.label === 'File' && typeof node.properties.filePath === 'string')
-              .map(node => node.properties.filePath)
-              ?? [],
+            backendTarget.repoSelector,
+            backendFilePaths,
+            backendFileContentsEntries,
             effectiveProjectName
           )
         : await api.initializeAgent(config, effectiveProjectName);
@@ -741,7 +760,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     } finally {
       setIsAgentInitializing(false);
     }
-  }, [graph, projectName, resolveBackendAgentTarget]);
+  }, [fileContents, graph, projectName, resolveBackendAgentTarget]);
 
   const sendChatMessage = useCallback(async (message: string): Promise<void> => {
     const api = apiRef.current;
@@ -1145,15 +1164,26 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
       // Reuse the same handleServerConnect logic inline
       const repoPath = result.repoInfo.repoPath;
       const pName = result.repoInfo.name || repoPath.split('/').pop() || 'server-project';
+      const backendTarget = {
+        backendUrl: toBackendBaseUrl(serverBaseUrl),
+        repoSelector: repoPath,
+      };
       setProjectName(pName);
+      setServerRepoSelector(repoPath);
 
       setGraph(createKnowledgeGraphFromData(result.nodes, result.relationships));
-      setFileContents(new Map<string, string>());
+      setFileContents(new Map(Object.entries(result.fileContents)));
 
       setViewMode('exploring');
       setProgress(null);
 
-      if (getActiveProviderConfig()) initializeAgent(pName);
+      if (getActiveProviderConfig()) {
+        initializeAgent(pName, {
+          backendTarget,
+          filePaths: getGraphFilePaths(result.nodes),
+          fileContentsEntries: Object.entries(result.fileContents),
+        });
+      }
 
       startEmbeddings().catch((err) => {
         if (err?.name === 'WebGPUNotAvailableError' || err?.message?.includes('WebGPU')) {
@@ -1171,7 +1201,7 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
       });
       setTimeout(() => { setViewMode('exploring'); setProgress(null); }, 3000);
     }
-  }, [serverBaseUrl, setProgress, setViewMode, setProjectName, setGraph, setFileContents, initializeAgent, startEmbeddings, setHighlightedNodeIds, clearAIToolHighlights, clearBlastRadius, setSelectedNode, setQueryResult, setCodeReferences, setCodePanelOpen, setCodeReferenceFocus]);
+  }, [serverBaseUrl, setProgress, setViewMode, setProjectName, setServerRepoSelector, setGraph, setFileContents, initializeAgent, startEmbeddings, setHighlightedNodeIds, clearAIToolHighlights, clearBlastRadius, setSelectedNode, setQueryResult, setCodeReferences, setCodePanelOpen, setCodeReferenceFocus]);
 
   const removeCodeReference = useCallback((id: string) => {
     setCodeReferences(prev => {
@@ -1271,6 +1301,8 @@ export const AppStateProvider = ({ children }: { children: ReactNode }) => {
     // Multi-repo switching
     serverBaseUrl,
     setServerBaseUrl,
+    serverRepoSelector,
+    setServerRepoSelector,
     availableRepos,
     setAvailableRepos,
     switchRepo,

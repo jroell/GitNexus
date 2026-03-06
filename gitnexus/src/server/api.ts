@@ -140,10 +140,15 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   const cleanupMcp = mountMCPEndpoints(app, backend);
 
   // Helper: resolve a repo by name from the global registry, or default to first
-  const resolveRepo = async (repoName?: string) => {
+  const resolveRepo = async (repoNameOrPath?: string) => {
     const repos = await listRegisteredRepos();
     if (repos.length === 0) return null;
-    if (repoName) return repos.find(r => r.name === repoName) || null;
+    if (repoNameOrPath) {
+      const resolvedPath = path.resolve(repoNameOrPath);
+      const byPath = repos.find(r => path.resolve(r.path) === resolvedPath);
+      if (byPath) return byPath;
+      return repos.find(r => r.name === repoNameOrPath) || null;
+    }
     return repos[0]; // default to first
   };
 

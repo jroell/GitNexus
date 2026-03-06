@@ -14,6 +14,17 @@ import { getActiveProviderConfig } from './core/llm/settings-service';
 import { createKnowledgeGraphFromData } from './core/graph/graph';
 import { connectToServer, fetchRepos, normalizeServerUrl, type ConnectToServerResult } from './services/server-connection';
 
+const toBackendBaseUrl = (serverApiUrl: string): string =>
+  serverApiUrl.replace(/\/+$/, '').replace(/\/api$/, '');
+
+const toFileContentsMap = (fileContents: Record<string, string>): Map<string, string> =>
+  new Map(Object.entries(fileContents));
+
+const getFilePathsFromNodes = (nodes: ConnectToServerResult['nodes']): string[] =>
+  nodes
+    .filter(node => node.label === 'File' && typeof node.properties.filePath === 'string')
+    .map(node => node.properties.filePath);
+
 const AppContent = () => {
   const {
     viewMode,
@@ -31,12 +42,11 @@ const AppContent = () => {
     refreshLLMSettings,
     initializeAgent,
     startEmbeddings,
-    embeddingStatus,
     codeReferences,
     selectedNode,
     isCodePanelOpen,
-    serverBaseUrl,
     setServerBaseUrl,
+    setServerRepoSelector,
     availableRepos,
     setAvailableRepos,
     switchRepo,
@@ -46,6 +56,9 @@ const AppContent = () => {
 
   const handleFileSelect = useCallback(async (file: File) => {
     const projectName = file.name.replace('.zip', '');
+    setServerBaseUrl(null);
+    setServerRepoSelector(null);
+    setAvailableRepos([]);
     setProjectName(projectName);
     setProgress({ phase: 'extracting', percent: 0, message: 'Starting...', detail: 'Preparing to extract files' });
     setViewMode('loading');
@@ -87,12 +100,15 @@ const AppContent = () => {
         setProgress(null);
       }, 3000);
     }
-  }, [setViewMode, setGraph, setFileContents, setProgress, setProjectName, runPipeline, startEmbeddings, initializeAgent]);
+  }, [setAvailableRepos, setServerBaseUrl, setServerRepoSelector, setViewMode, setGraph, setFileContents, setProgress, setProjectName, runPipeline, startEmbeddings, initializeAgent]);
 
   const handleGitClone = useCallback(async (files: FileEntry[]) => {
     const firstPath = files[0]?.path || 'repository';
     const projectName = firstPath.split('/')[0].replace(/-\d+$/, '') || 'repository';
 
+    setServerBaseUrl(null);
+    setServerRepoSelector(null);
+    setAvailableRepos([]);
     setProjectName(projectName);
     setProgress({ phase: 'extracting', percent: 0, message: 'Starting...', detail: 'Preparing to process files' });
     setViewMode('loading');
@@ -130,16 +146,20 @@ const AppContent = () => {
         setProgress(null);
       }, 3000);
     }
-  }, [setViewMode, setGraph, setFileContents, setProgress, setProjectName, runPipelineFromFiles, startEmbeddings, initializeAgent]);
+  }, [setAvailableRepos, setServerBaseUrl, setServerRepoSelector, setViewMode, setGraph, setFileContents, setProgress, setProjectName, runPipelineFromFiles, startEmbeddings, initializeAgent]);
 
-  const handleServerConnect = useCallback((result: ConnectToServerResult) => {
+  const handleServerConnect = useCallback((result: ConnectToServerResult, serverApiUrl?: string) => {
     // Extract project name from repoPath
     const repoPath = result.repoInfo.repoPath;
     const projectName = result.repoInfo.name || repoPath.split('/').pop() || 'server-project';
+    if (serverApiUrl) {
+      setServerBaseUrl(serverApiUrl);
+    }
+    setServerRepoSelector(repoPath);
     setProjectName(projectName);
 
     setGraph(createKnowledgeGraphFromData(result.nodes, result.relationships));
-    setFileContents(new Map<string, string>());
+    setFileContents(toFileContentsMap(result.fileContents));
 
     // Transition directly to exploring view
     setViewMode('exploring');
@@ -147,7 +167,14 @@ const AppContent = () => {
 
     // Initialize agent if LLM is configured
     if (getActiveProviderConfig()) {
-      initializeAgent(projectName);
+      initializeAgent(projectName, serverApiUrl ? {
+        backendTarget: {
+          backendUrl: toBackendBaseUrl(serverApiUrl),
+          repoSelector: repoPath,
+        },
+        filePaths: getFilePathsFromNodes(result.nodes),
+        fileContentsEntries: Object.entries(result.fileContents),
+      } : undefined);
     }
 
     // Auto-start embeddings
@@ -158,7 +185,7 @@ const AppContent = () => {
         console.warn('Embeddings auto-start failed:', err);
       }
     });
-  }, [setViewMode, setGraph, setFileContents, setProjectName, initializeAgent, startEmbeddings, setProgress]);
+  }, [setServerBaseUrl, setServerRepoSelector, setViewMode, setGraph, setFileContents, setProjectName, initializeAgent, startEmbeddings, setProgress]);
 
   // Auto-connect when ?server query param is present (bookmarkable shortcut)
   const autoConnectRan = useRef(false);
@@ -190,10 +217,8 @@ const AppContent = () => {
         setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Hydrating graph indexes' });
       }
     }).then(async (result) => {
-      handleServerConnect(result);
+      handleServerConnect(result, baseUrl);
 
-      // Store server URL and fetch available repos for the repo switcher
-      setServerBaseUrl(baseUrl);
       try {
         const repos = await fetchRepos(baseUrl);
         setAvailableRepos(repos);
@@ -213,7 +238,7 @@ const AppContent = () => {
         setProgress(null);
       }, 3000);
     });
-  }, [handleServerConnect, setProgress, setViewMode, setServerBaseUrl, setAvailableRepos]);
+  }, [handleServerConnect, setProgress, setViewMode, setAvailableRepos]);
 
   const handleFocusNode = useCallback((nodeId: string) => {
     graphCanvasRef.current?.focusNode(nodeId);
@@ -233,16 +258,13 @@ const AppContent = () => {
         onFileSelect={handleFileSelect}
         onGitClone={handleGitClone}
         onServerConnect={async (result, serverUrl) => {
-          handleServerConnect(result);
-          if (serverUrl) {
-            const baseUrl = normalizeServerUrl(serverUrl);
-            setServerBaseUrl(baseUrl);
-            try {
-              const repos = await fetchRepos(baseUrl);
-              setAvailableRepos(repos);
-            } catch (e) {
-              console.warn('Failed to fetch repo list:', e);
-            }
+          const baseUrl = normalizeServerUrl(serverUrl || window.location.origin);
+          handleServerConnect(result, baseUrl);
+          try {
+            const repos = await fetchRepos(baseUrl);
+            setAvailableRepos(repos);
+          } catch (e) {
+            console.warn('Failed to fetch repo list:', e);
           }
         }}
       />

@@ -130,6 +130,7 @@ export class LocalBackend {
     for (const entry of entries) {
       const id = this.repoId(entry.name, entry.path);
       freshIds.add(id);
+      const previous = this.repos.get(id);
 
       const storagePath = entry.storagePath;
       const kuzuPath = path.join(storagePath, 'kuzu');
@@ -146,6 +147,13 @@ export class LocalBackend {
       };
 
       this.repos.set(id, handle);
+      if (
+        !previous ||
+        previous.indexedAt !== entry.indexedAt ||
+        previous.lastCommit !== entry.lastCommit
+      ) {
+        this.embeddingAvailability.delete(id);
+      }
 
       // Build lightweight context (no KuzuDB needed)
       const s = entry.stats || {};
@@ -166,6 +174,7 @@ export class LocalBackend {
         this.repos.delete(id);
         this.contextCache.delete(id);
         this.initializedRepos.delete(id);
+        this.embeddingAvailability.delete(id);
       }
     }
   }

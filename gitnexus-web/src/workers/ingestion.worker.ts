@@ -194,6 +194,48 @@ const createHttpGrep = (backendUrl: string, repo: string) => {
   };
 };
 
+const grepStoredFileContents = (params: {
+  pattern: string;
+  fileFilter?: string;
+  caseSensitive?: boolean;
+  maxResults?: number;
+}): Array<{ file: string; line: number; content: string }> => {
+  const flags = params.caseSensitive ? 'g' : 'gi';
+  let regex: RegExp;
+  try {
+    regex = new RegExp(params.pattern, flags);
+  } catch {
+    return [];
+  }
+
+  const maxResults = params.maxResults ?? 100;
+  const fileFilter = params.fileFilter?.toLowerCase();
+  const matches: Array<{ file: string; line: number; content: string }> = [];
+
+  for (const [filePath, content] of storedFileContents.entries()) {
+    if (fileFilter && !filePath.toLowerCase().includes(fileFilter)) {
+      continue;
+    }
+
+    const lines = content.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      if (regex.test(lines[i])) {
+        matches.push({
+          file: filePath,
+          line: i + 1,
+          content: lines[i].trim().slice(0, 150),
+        });
+        if (matches.length >= maxResults) {
+          return matches;
+        }
+      }
+      regex.lastIndex = 0;
+    }
+  }
+
+  return matches;
+};
+
 /**
  * Worker API exposed via Comlink
  * 
@@ -696,8 +738,9 @@ const workerApi = {
    * Uses HTTP wrappers instead of local KuzuDB for all tool queries.
    * @param config - Provider configuration for the LLM
    * @param backendUrl - Base URL of the gitnexus serve backend
-   * @param repoName - Repository name on the backend
+   * @param repoName - Repository selector on the backend (full path or name)
    * @param filePaths - Known repository file paths for fuzzy path matching
+   * @param fileContentsEntries - Optional file contents embedded in the graph response
    * @param projectName - Display name for the project
    */
   async initializeBackendAgent(
@@ -705,17 +748,33 @@ const workerApi = {
     backendUrl: string,
     repoName: string,
     filePaths: string[],
+    fileContentsEntries: [string, string][],
     projectName?: string,
   ): Promise<{ success: boolean; error?: string }> {
     try {
-      storedFileContents = new Map();
-      storedKnownFilePaths = Array.from(new Set(filePaths));
+      storedFileContents = new Map(fileContentsEntries);
+      storedKnownFilePaths = Array.from(new Set([
+        ...filePaths,
+        ...storedFileContents.keys(),
+      ]));
 
       // Create HTTP-based tool wrappers
       const executeQuery = createHttpExecuteQuery(backendUrl, repoName);
       const hybridSearch = createHttpHybridSearch(backendUrl, repoName);
       const readFile = createHttpReadFile(backendUrl, repoName);
-      const grepFiles = createHttpGrep(backendUrl, repoName);
+      const httpGrep = createHttpGrep(backendUrl, repoName);
+      const grepFiles = async (params: {
+        pattern: string;
+        fileFilter?: string;
+        caseSensitive?: boolean;
+        maxResults?: number;
+      }) => {
+        const httpResults = await httpGrep(params);
+        if (httpResults.length > 0 || storedFileContents.size === 0) {
+          return httpResults;
+        }
+        return grepStoredFileContents(params);
+      };
 
       // Build codebase context (uses Cypher queries — works via HTTP)
       let codebaseContext: CodebaseContext | undefined;

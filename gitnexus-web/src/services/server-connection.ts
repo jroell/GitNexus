@@ -30,6 +30,7 @@ export interface ServerRepoInfo {
 export interface ConnectToServerResult {
   nodes: GraphNode[];
   relationships: GraphRelationship[];
+  fileContents: Record<string, string>;
   repoInfo: ServerRepoInfo;
 }
 
@@ -123,6 +124,18 @@ export async function fetchGraph(
   return JSON.parse(text);
 }
 
+export function extractFileContents(nodes: GraphNode[]): Record<string, string> {
+  const contents: Record<string, string> = {};
+  for (const node of nodes) {
+    if (node.label !== 'File') continue;
+    const content = (node.properties as any).content;
+    if (typeof content === 'string' && content.length > 0) {
+      contents[node.properties.filePath] = content;
+    }
+  }
+  return contents;
+}
+
 export async function fetchFileContent(
   baseUrl: string,
   filePath: string,
@@ -181,5 +194,10 @@ export async function connectToServer(
   );
 
   onProgress?.('hydrating', 0, null);
-  return { nodes, relationships, repoInfo };
+  return {
+    nodes,
+    relationships,
+    fileContents: extractFileContents(nodes),
+    repoInfo,
+  };
 }

@@ -29,6 +29,11 @@ const CHUNK_BYTE_BUDGET = 20 * 1024 * 1024; // 20MB
 const AST_CACHE_CAP = 50;
 
 const resolveParseWorkerUrl = (): URL => {
+  const tsUrl = new URL('./workers/parse-worker.ts', import.meta.url);
+  if (fs.existsSync(fileURLToPath(tsUrl))) {
+    return tsUrl;
+  }
+
   const jsUrl = new URL('./workers/parse-worker.js', import.meta.url);
   if (fs.existsSync(fileURLToPath(jsUrl))) {
     return jsUrl;
