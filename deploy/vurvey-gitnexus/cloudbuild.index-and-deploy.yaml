@@ -1,0 +1,235 @@
+timeout: 21600s
+
+options:
+  machineType: E2_HIGHCPU_32
+  diskSizeGb: 200
+  logging: CLOUD_LOGGING_ONLY
+
+substitutions:
+  _ENV: staging
+  _REGION: us-central1
+  _SERVICE: gitnexus-staging
+  _API_REF: staging
+  _WEB_REF: staging
+  _CLI_REF: main
+  _IMAGE_TAG: manual
+
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/gitnexus-github-token/versions/latest
+      env: GITHUB_TOKEN
+    - versionName: projects/$PROJECT_ID/secrets/gitnexus-basic-auth-user/versions/latest
+      env: BASIC_AUTH_USER
+    - versionName: projects/$PROJECT_ID/secrets/gitnexus-basic-auth-password/versions/latest
+      env: BASIC_AUTH_PASSWORD
+    - versionName: projects/$PROJECT_ID/secrets/gitnexus-openai-api-key/versions/latest
+      env: GITNEXUS_EMBEDDING_API_KEY
+
+steps:
+  - id: index-vurvey-repos
+    name: node:22-trixie
+    entrypoint: /bin/bash
+    secretEnv:
+      - GITHUB_TOKEN
+      - GITNEXUS_EMBEDDING_API_KEY
+    args:
+      - -ceu
+      - |
+        apt-get update
+        apt-get install -y --no-install-recommends git python3 make g++
+        git clone --depth 1 https://github.com/abhigyanpatwari/GitNexus.git /workspace/gitnexus-src
+        sed -i 's/const HTTP_TIMEOUT_MS = 30_000;/const HTTP_TIMEOUT_MS = Number(process.env.GITNEXUS_EMBEDDING_HTTP_TIMEOUT_MS ?? 120_000);/' /workspace/gitnexus-src/gitnexus/src/core/embeddings/http-client.ts
+        npm install --prefix /workspace/gitnexus-src/gitnexus-shared --include=dev --ignore-scripts --no-audit --no-fund
+        npm install --prefix /workspace/gitnexus-src/gitnexus --include=dev --ignore-scripts --no-audit --no-fund
+        npm rebuild --prefix /workspace/gitnexus-src/gitnexus
+        npm run --prefix /workspace/gitnexus-src/gitnexus postinstall
+        npm run --prefix /workspace/gitnexus-src/gitnexus build
+        GITNEXUS_CLI=/workspace/gitnexus-src/gitnexus/dist/cli/index.js
+
+        export GITNEXUS_HOME=/workspace/.gitnexus-runtime
+        export HF_HOME=/workspace/.hf-cache
+        export NODE_OPTIONS="--max-old-space-size=24576"
+        export GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS=180000
+        export GITNEXUS_EMBEDDING_URL=https://api.openai.com/v1
+        export GITNEXUS_EMBEDDING_MODEL=text-embedding-3-small
+        export GITNEXUS_EMBEDDING_DIMS=1536
+        export GITNEXUS_EMBEDDING_HTTP_TIMEOUT_MS=120000
+        mkdir -p "$$GITNEXUS_HOME/repos" "$$HF_HOME"
+
+        clone_ref() {
+          repo="$$1"
+          ref="$$2"
+          dir="$$3"
+          echo "Cloning Batterii/$${repo}@$${ref} -> $${dir}" >&2
+          rm -rf "$$dir"
+          if ! git clone --depth 1 --branch "$$ref" "https://x-access-token:$${GITHUB_TOKEN}@github.com/Batterii/$${repo}.git" "$$dir"; then
+            git clone "https://x-access-token:$${GITHUB_TOKEN}@github.com/Batterii/$${repo}.git" "$$dir"
+            git -C "$$dir" checkout "$$ref"
+          fi
+          git -C "$$dir" rev-parse HEAD
+        }
+
+        analyze_repo() {
+          repo="$$1"
+          dir="$$2"
+          alias="$$3"
+          echo "[$$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Analyzing $${repo} as $${alias}"
+          node "$$GITNEXUS_CLI" analyze "$$dir" \
+            --name "$$alias" \
+            --embeddings 0 \
+            --embedding-threads 8 \
+            --embedding-batch-size 64 \
+            --embedding-sub-batch-size 32 \
+            --skip-agents-md
+          echo "[$$(date -u +"%Y-%m-%dT%H:%M:%SZ")] Finished $${repo} as $${alias}"
+        }
+
+        ENV_NAME="${_ENV}"
+        API_DIR="$$GITNEXUS_HOME/repos/vurvey-api-$${ENV_NAME}"
+        WEB_DIR="$$GITNEXUS_HOME/repos/vurvey-web-manager-$${ENV_NAME}"
+        CLI_DIR="$$GITNEXUS_HOME/repos/vurvey-cli-$${ENV_NAME}"
+
+        API_SHA="$$(clone_ref vurvey-api "${_API_REF}" "$$API_DIR")"
+        WEB_SHA="$$(clone_ref vurvey-web-manager "${_WEB_REF}" "$$WEB_DIR")"
+        CLI_SHA="$$(clone_ref vurvey-cli "${_CLI_REF}" "$$CLI_DIR")"
+
+        analyze_repo vurvey-api "$$API_DIR" "vurvey-api-$${ENV_NAME}"
+        analyze_repo vurvey-web-manager "$$WEB_DIR" "vurvey-web-manager-$${ENV_NAME}"
+        analyze_repo vurvey-cli "$$CLI_DIR" "vurvey-cli-$${ENV_NAME}"
+
+        GROUP="vurvey-$${ENV_NAME}"
+        GROUP_DIR="$$GITNEXUS_HOME/groups/$$GROUP"
+        mkdir -p "$$GROUP_DIR"
+        cat > "$$GROUP_DIR/group.yaml" <<EOF
+        version: 1
+        name: $$GROUP
+        description: Vurvey API, web manager, and CLI indexed for $$ENV_NAME
+        repos:
+          api: vurvey-api-$$ENV_NAME
+          web-manager: vurvey-web-manager-$$ENV_NAME
+          cli: vurvey-cli-$$ENV_NAME
+        links: []
+        packages: {}
+        detect:
+          http: true
+          grpc: true
+          topics: true
+          shared_libs: true
+          embedding_fallback: true
+        matching:
+          bm25_threshold: 0.7
+          embedding_threshold: 0.65
+          max_candidates_per_step: 3
+          exclude_links_paths: [/ping, /health, /healthcheck]
+          exclude_links_param_only_paths: true
+        EOF
+
+        node "$$GITNEXUS_CLI" group sync "$$GROUP" --verbose
+        node "$$GITNEXUS_CLI" list
+        node "$$GITNEXUS_CLI" group status "$$GROUP"
+
+        cat > "$$GITNEXUS_HOME/manifest.json" <<EOF
+        {
+          "environment": "$$ENV_NAME",
+          "group": "$$GROUP",
+          "generatedAt": "$$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+          "gitnexusSource": "https://github.com/abhigyanpatwari/GitNexus.git",
+          "repos": {
+            "vurvey-api": { "ref": "${_API_REF}", "sha": "$$API_SHA", "registryName": "vurvey-api-$$ENV_NAME" },
+            "vurvey-web-manager": { "ref": "${_WEB_REF}", "sha": "$$WEB_SHA", "registryName": "vurvey-web-manager-$$ENV_NAME" },
+            "vurvey-cli": { "ref": "${_CLI_REF}", "sha": "$$CLI_SHA", "registryName": "vurvey-cli-$$ENV_NAME" }
+          }
+        }
+        EOF
+
+        npm prune --prefix /workspace/gitnexus-src/gitnexus --omit=dev --no-audit --no-fund
+        rm -rf /workspace/gitnexus-package
+        cp -a /workspace/gitnexus-src/gitnexus /workspace/gitnexus-package
+
+  - id: build-runtime-image
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --tag
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/gitnexus/${_SERVICE}:${_IMAGE_TAG}
+      - --tag
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/gitnexus/${_SERVICE}:latest
+      - .
+
+  - id: push-runtime-image-tag
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/gitnexus/${_SERVICE}:${_IMAGE_TAG}
+
+  - id: push-runtime-image-latest
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/gitnexus/${_SERVICE}:latest
+
+  - id: deploy-cloud-run
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --project=$PROJECT_ID
+      - --region=${_REGION}
+      - --platform=managed
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/gitnexus/${_SERVICE}:${_IMAGE_TAG}
+      - --allow-unauthenticated
+      - --port=8080
+      - --cpu=2
+      - --memory=8Gi
+      - --timeout=3600
+      - --concurrency=20
+      - --max-instances=3
+      - --set-env-vars=GITNEXUS_ENV=${_ENV},GITNEXUS_EMBEDDING_URL=https://api.openai.com/v1,GITNEXUS_EMBEDDING_MODEL=text-embedding-3-small,GITNEXUS_EMBEDDING_DIMS=1536,GITNEXUS_EMBEDDING_HTTP_TIMEOUT_MS=120000
+      - --set-secrets=BASIC_AUTH_USER=gitnexus-basic-auth-user:latest,BASIC_AUTH_PASSWORD=gitnexus-basic-auth-password:latest,GITNEXUS_EMBEDDING_API_KEY=gitnexus-openai-api-key:latest
+
+  - id: verify-cloud-run
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: /bin/bash
+    secretEnv:
+      - BASIC_AUTH_USER
+      - BASIC_AUTH_PASSWORD
+    args:
+      - -ceu
+      - |
+        URL="$$(gcloud run services describe "${_SERVICE}" --project="$PROJECT_ID" --region="${_REGION}" --format='value(status.url)')"
+        echo "Service URL: $$URL"
+        curl -fsS "$$URL/_health"
+
+        # Cloud Run may route traffic before gitnexus serve has finished warming.
+        # Wait up to 15 minutes for /api/health to return 200.
+        HEALTH_CODE=0
+        for _ in $$(seq 1 60); do
+          HEALTH_CODE="$$(curl -sS -o /tmp/gitnexus-health.json -w '%{http_code}' -u "$$BASIC_AUTH_USER:$$BASIC_AUTH_PASSWORD" "$$URL/api/health" || true)"
+          if [ "$$HEALTH_CODE" = "200" ]; then
+            break
+          fi
+          sleep 15
+        done
+        if [ "$$HEALTH_CODE" != "200" ]; then
+          echo "GitNexus failed readiness check: HTTP $$HEALTH_CODE"
+          cat /tmp/gitnexus-health.json || true
+          exit 1
+        fi
+
+        REPOS_JSON="$$(curl -fsS -u "$$BASIC_AUTH_USER:$$BASIC_AUTH_PASSWORD" "$$URL/api/repos")"
+        echo "$$REPOS_JSON" | grep -q "\"name\":\"vurvey-api-${_ENV}\""
+        echo "$$REPOS_JSON" | grep -q "\"name\":\"vurvey-web-manager-${_ENV}\""
+        echo "$$REPOS_JSON" | grep -q "\"name\":\"vurvey-cli-${_ENV}\""
+
+        curl -fsS -u "$$BASIC_AUTH_USER:$$BASIC_AUTH_PASSWORD" "$$URL/api/repo?repo=vurvey-api-${_ENV}" >/tmp/gitnexus-repo.json
+        curl -fsS -u "$$BASIC_AUTH_USER:$$BASIC_AUTH_PASSWORD" \
+          -H 'Content-Type: application/json' \
+          -d '{"query":"composioEnabled","limit":3,"mode":"hybrid","repo":"vurvey-api-${_ENV}"}' \
+          "$$URL/api/search" >/tmp/gitnexus-search.json
+        grep -q '"results"' /tmp/gitnexus-search.json
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/gitnexus/${_SERVICE}:${_IMAGE_TAG}
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/gitnexus/${_SERVICE}:latest
