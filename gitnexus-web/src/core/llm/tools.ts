@@ -358,6 +358,29 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
         }
 
         const limit = maxResults ?? 100;
+        const looksLikeLiteralFilePathQuery =
+          pattern.includes('/') &&
+          /\.[A-Za-z0-9]+$/.test(pattern) &&
+          !/[*+?^${}()|[\]\\]/.test(pattern);
+
+        // Users and models often ask grep to verify a file path.
+        // Grep searches file contents, not file paths, so fall back to search here.
+        if (looksLikeLiteralFilePathQuery) {
+          const searchResults = await backendSearch(pattern, { limit, enrich: false });
+          const uniquePaths = Array.from(
+            new Set(searchResults.map((r) => r.filePath).filter(Boolean)),
+          ) as string[];
+
+          if (uniquePaths.length === 0) {
+            return `No file path matches for "${pattern}". Note: grep searches file contents; this result came from path-aware search fallback.`;
+          }
+
+          return `Path search fallback (grep does not search file paths):\n\n${uniquePaths
+            .slice(0, limit)
+            .map((p, i) => `[${i + 1}] ${p}`)
+            .join('\n')}`;
+        }
+
         const fullPattern = fileFilter
           ? `(?=.*${fileFilter.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}).*${pattern}`
           : pattern;
@@ -365,7 +388,7 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
         const results = await backendGrep(fullPattern, limit);
 
         if (results.length === 0) {
-          return `No matches for "${pattern}"${fileFilter ? ` in files matching "${fileFilter}"` : ''}`;
+          return `No matches for "${pattern}"${fileFilter ? ` in files matching "${fileFilter}"` : ''}. If you are checking file path existence, use search instead of grep.`;
         }
 
         const formatted = results.map((r) => `${r.filePath}:${r.line}: ${r.text}`).join('\n');
@@ -379,7 +402,7 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
     {
       name: 'grep',
       description:
-        'Search for exact text patterns across all files using regex. Use for finding specific strings, error messages, TODOs, variable names, etc.',
+        'Search for exact text patterns inside file contents using regex. Not for file-path existence checks. Use for strings, error messages, TODOs, variable names, etc.',
       schema: z.object({
         pattern: z
           .string()
@@ -420,7 +443,7 @@ MATCH (n:Function {id: emb.nodeId}) RETURN n`,
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
         if (message.includes('not found') || message.includes('404')) {
-          return `File not found: "${filePath}". Use grep to search for the correct path.`;
+          return `File not found: "${filePath}". Use search to find the correct path, then read again.`;
         }
         return `Error reading file: ${message}`;
       }

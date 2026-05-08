@@ -1,0 +1,9 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+USER root
+
+COPY --chown=node:node gitnexus/web /app/gitnexus/web
+COPY --chown=node:node deploy/vurvey-gitnexus/server-auth-proxy.mjs /app/server-auth-proxy.mjs
+
+USER node

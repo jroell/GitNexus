@@ -7,6 +7,9 @@ const gitnexusPort = Number(process.env.GITNEXUS_INTERNAL_PORT || 4747);
 const username = process.env.BASIC_AUTH_USER || 'gitnexus';
 const password = process.env.BASIC_AUTH_PASSWORD || '';
 const gitnexusHome = process.env.GITNEXUS_HOME || '/workspace/.gitnexus-runtime';
+const backendProbeTimeoutMs = Number(process.env.GITNEXUS_BACKEND_PROBE_TIMEOUT_MS || 2000);
+const backendWarmupPollMs = Number(process.env.GITNEXUS_BACKEND_WARMUP_POLL_MS || 1000);
+const proxyRequestTimeoutMs = Number(process.env.GITNEXUS_PROXY_TIMEOUT_MS || 120000);
 
 if (!password) {
   console.error('BASIC_AUTH_PASSWORD is required');
@@ -14,6 +17,9 @@ if (!password) {
 }
 
 const expected = `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`;
+let backendReady = false;
+let backendWarmupInProgress = false;
+let lastBackendError = 'GitNexus backend is still starting';
 
 const child = spawn(
   'node',
@@ -39,6 +45,67 @@ child.on('exit', (code, signal) => {
   process.exit(code ?? 1);
 });
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function writeJson(res, statusCode, body, headers = {}) {
+  res.writeHead(statusCode, { 'Content-Type': 'application/json', ...headers });
+  res.end(JSON.stringify(body));
+}
+
+function checkBackendHealth() {
+  return new Promise((resolve) => {
+    const probeReq = http.request(
+      {
+        hostname: '127.0.0.1',
+        port: gitnexusPort,
+        method: 'GET',
+        path: '/api/health',
+      },
+      (probeRes) => {
+        probeRes.resume();
+        const status = probeRes.statusCode ?? 0;
+        resolve(status >= 200 && status < 400);
+      },
+    );
+
+    probeReq.setTimeout(backendProbeTimeoutMs, () => {
+      probeReq.destroy(new Error(`health probe timeout after ${backendProbeTimeoutMs}ms`));
+    });
+
+    probeReq.on('error', (err) => {
+      lastBackendError = err.message;
+      resolve(false);
+    });
+
+    probeReq.end();
+  });
+}
+
+async function warmupBackend() {
+  if (backendReady || backendWarmupInProgress) return;
+  backendWarmupInProgress = true;
+  console.log(`Waiting for GitNexus backend on 127.0.0.1:${gitnexusPort}...`);
+
+  try {
+    while (!backendReady) {
+      const ready = await checkBackendHealth();
+      if (ready) {
+        backendReady = true;
+        lastBackendError = '';
+        console.log(`GitNexus backend is ready on 127.0.0.1:${gitnexusPort}`);
+        break;
+      }
+      await sleep(backendWarmupPollMs);
+    }
+  } finally {
+    backendWarmupInProgress = false;
+  }
+}
+
+void warmupBackend();
+
 function unauthorized(res) {
   res.writeHead(401, {
     'WWW-Authenticate': 'Basic realm="Vurvey GitNexus", charset="UTF-8"',
@@ -49,13 +116,32 @@ function unauthorized(res) {
 
 const server = http.createServer((req, res) => {
   if (req.url === '/_health') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('ok');
+    if (!backendReady) {
+      writeJson(res, 503, {
+        status: 'warming',
+        detail: lastBackendError || 'GitNexus backend is still starting',
+      });
+      return;
+    }
+    writeJson(res, 200, { status: 'ok' });
     return;
   }
 
   if (req.headers.authorization !== expected) {
     unauthorized(res);
+    return;
+  }
+
+  if (!backendReady) {
+    writeJson(
+      res,
+      503,
+      {
+        error: 'GitNexus backend is still starting. Retry in a few seconds.',
+        detail: lastBackendError || undefined,
+      },
+      { 'Retry-After': '5' },
+    );
     return;
   }
 
@@ -76,9 +162,15 @@ const server = http.createServer((req, res) => {
     },
   );
 
+  proxyReq.setTimeout(proxyRequestTimeoutMs, () => {
+    proxyReq.destroy(new Error(`upstream timeout after ${proxyRequestTimeoutMs}ms`));
+  });
+
   proxyReq.on('error', (err) => {
-    res.writeHead(502, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: err.message }));
+    backendReady = false;
+    lastBackendError = err.message;
+    void warmupBackend();
+    writeJson(res, 503, { error: err.message });
   });
 
   req.pipe(proxyReq);

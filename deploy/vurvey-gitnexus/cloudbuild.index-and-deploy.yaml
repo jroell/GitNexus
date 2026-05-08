@@ -185,7 +185,9 @@ steps:
       - --memory=8Gi
       - --timeout=3600
       - --concurrency=20
+      - --min-instances=1
       - --max-instances=3
+      - --startup-probe=httpGet.path=/_health,httpGet.port=8080,timeoutSeconds=3,periodSeconds=4,failureThreshold=60
       - --set-env-vars=GITNEXUS_ENV=${_ENV},GITNEXUS_EMBEDDING_URL=https://api.openai.com/v1,GITNEXUS_EMBEDDING_MODEL=text-embedding-3-small,GITNEXUS_EMBEDDING_DIMS=1536,GITNEXUS_EMBEDDING_HTTP_TIMEOUT_MS=120000
       - --set-secrets=BASIC_AUTH_USER=gitnexus-basic-auth-user:latest,BASIC_AUTH_PASSWORD=gitnexus-basic-auth-password:latest,GITNEXUS_EMBEDDING_API_KEY=gitnexus-openai-api-key:latest
 

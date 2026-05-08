@@ -68,11 +68,12 @@ You are an investigator. For each question:
 3. **Trace** → Use cypher to follow connections in the graph
 4. **Cite** → Ground every finding with [[file:line]] or [[Type:Name]]
 5. **Validate** → Use cypher to validate the results and confirm completeness of context before final output. ( MUST DO )
+6. **Path checks** → For file existence/path questions, use search first (not grep), then read for confirmation.
 
 ## 🛠️ TOOLS
 - **\`search\`** — Hybrid search. Results grouped by process with cluster context.
 - **\`cypher\`** — Cypher queries against the graph. Use \`{{QUERY_VECTOR}}\` for vector search.
-- **\`grep\`** — Regex search. Best for exact strings, TODOs, error codes.
+- **\`grep\`** — Regex search of file content lines only. Do not use as primary tool for file-path existence checks.
 - **\`read\`** — Read file content. Always use after search/grep to see full code.
 - **\`explore\`** — Deep dive on a symbol, cluster, or process. Shows membership, participation, connections.
 - **\`overview\`** — Codebase map showing all clusters and processes.
@@ -102,6 +103,7 @@ Cypher examples:
 - **Cite or retract.** Never state something you can't ground.
 - **Read before concluding.** Don't guess from names alone.
 - **Retry on failure.** If a tool fails, fix the input and try again.
+- **If grep returns no hits for a path-like query, retry with search before concluding missing evidence.**
 - **Cyfer tool validation** prefer using cyfer tool in anything that requires graph connections.
 - **OUTPUT STYLE** Prefer using tables and mermaid diagrams instead of long explanations.
 - ALWAYS USE MERMAID FOR VISUALIZATION AND STRUCTURING THE OUTPUT.
@@ -338,6 +340,10 @@ export interface AgentMessage {
 export async function* streamAgentResponse(
   agent: ReturnType<typeof createReactAgent>,
   messages: AgentMessage[],
+  options?: {
+    signal?: AbortSignal;
+    recursionLimit?: number;
+  },
 ): AsyncGenerator<AgentStreamChunk> {
   try {
     const formattedMessages = messages.map((m) => ({
@@ -348,8 +354,9 @@ export async function* streamAgentResponse(
     // Use BOTH modes: 'values' for structure, 'messages' for token streaming
     const stream = await agent.stream({ messages: formattedMessages }, {
       streamMode: ['values', 'messages'] as any,
-      // Allow longer tool/reasoning loops (more Cursor-like persistence)
-      recursionLimit: 50,
+      // Keep loops bounded so path checks don't spin indefinitely.
+      recursionLimit: options?.recursionLimit ?? 20,
+      ...(options?.signal ? { signal: options.signal } : {}),
     } as any);
 
     // Track what we've yielded to avoid duplicates
@@ -364,6 +371,8 @@ export async function* streamAgentResponse(
     let hasSeenToolCallThisTurn = false;
 
     for await (const event of stream) {
+      if (options?.signal?.aborted) return;
+
       // Events come as [streamMode, data] tuples when using multiple modes
       // or just data when using single mode
       let mode: string;
@@ -539,6 +548,9 @@ export async function* streamAgentResponse(
     }
     yield { type: 'done' };
   } catch (error) {
+    if (options?.signal?.aborted) {
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     // DEBUG: Stream error
     if (import.meta.env.DEV) {

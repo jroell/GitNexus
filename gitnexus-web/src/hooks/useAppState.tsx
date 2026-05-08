@@ -337,6 +337,9 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [isChatLoading, setIsChatLoading] = useState(false);
   const [currentToolCalls, setCurrentToolCalls] = useState<ToolCallInfo[]>([]);
+  // Active chat stream tracking (for stop/clear/repo-switch behavior)
+  const activeChatAbortRef = useRef<AbortController | null>(null);
+  const activeChatRequestIdRef = useRef(0);
 
   // Code References Panel state
   const [codeReferences, setCodeReferences] = useState<CodeReference[]>([]);
@@ -566,6 +569,27 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
   // Agent state — agent runs on main thread now (I/O-bound, not CPU-bound)
   const agentRef = useRef<any>(null);
 
+  const abortActiveChatStream = useCallback(() => {
+    activeChatRequestIdRef.current += 1;
+    activeChatAbortRef.current?.abort();
+    activeChatAbortRef.current = null;
+    setIsChatLoading(false);
+    setCurrentToolCalls([]);
+  }, []);
+
+  const isAbortLikeError = useCallback((error: unknown): boolean => {
+    if (error instanceof DOMException && error.name === 'AbortError') return true;
+    const message = error instanceof Error ? error.message : String(error);
+    return /abort(ed)?/i.test(message);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      activeChatAbortRef.current?.abort();
+      activeChatAbortRef.current = null;
+    };
+  }, []);
+
   const initializeAgent = useCallback(
     async (overrideProjectName?: string): Promise<void> => {
       const config = getActiveProviderConfig();
@@ -574,6 +598,8 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
         return;
       }
 
+      // Ensure there is no stale stream writing into state while agent reinitializes.
+      abortActiveChatStream();
       setIsAgentInitializing(true);
       setAgentError(null);
 
@@ -618,7 +644,7 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [], // repoRef is a stable ref — we sync it explicitly on entry; no state deps needed
+    [abortActiveChatStream], // repoRef is a stable ref — we sync it explicitly on entry
   );
 
   const sendChatMessage = useCallback(
@@ -627,6 +653,8 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
       clearAICodeReferences();
       // Also clear previous tool-driven AI highlights (highlight_in_graph)
       clearAIToolHighlights();
+      // Single-flight chat: abort any previous stream before sending a new message.
+      abortActiveChatStream();
 
       if (!isAgentReady) {
         // Try to initialize first
@@ -661,6 +689,9 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
 
       setIsChatLoading(true);
       setCurrentToolCalls([]);
+      const requestId = activeChatRequestIdRef.current;
+      const abortController = new AbortController();
+      activeChatAbortRef.current = abortController;
 
       // Prepare message history for agent (convert our format to AgentMessage format)
       const history: AgentMessage[] = [...chatMessages, userMessage].map((m) => ({
@@ -714,6 +745,10 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
 
       try {
         const onChunk = (chunk: AgentStreamChunk) => {
+          if (requestId !== activeChatRequestIdRef.current || abortController.signal.aborted) {
+            return;
+          }
+
           switch (chunk.type) {
             case 'reasoning':
               // LLM's thinking/reasoning - accumulate contiguous reasoning
@@ -984,22 +1019,43 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
         const agent = agentRef.current;
         if (!agent) throw new Error('Agent not initialized');
         const { streamAgentResponse } = await import('../core/llm/agent');
-        for await (const chunk of streamAgentResponse(agent, history)) {
+        for await (const chunk of streamAgentResponse(agent, history, {
+          signal: abortController.signal,
+        })) {
+          if (requestId !== activeChatRequestIdRef.current || abortController.signal.aborted) {
+            break;
+          }
           onChunk(chunk);
         }
-        onChunk({ type: 'done' });
+        if (requestId === activeChatRequestIdRef.current && !abortController.signal.aborted) {
+          onChunk({ type: 'done' });
+        }
       } catch (error) {
+        if (
+          requestId !== activeChatRequestIdRef.current ||
+          abortController.signal.aborted ||
+          isAbortLikeError(error)
+        ) {
+          return;
+        }
         const message = error instanceof Error ? error.message : String(error);
         setAgentError(message);
       } finally {
-        setIsChatLoading(false);
-        setCurrentToolCalls([]);
+        if (activeChatAbortRef.current === abortController) {
+          activeChatAbortRef.current = null;
+        }
+        if (requestId === activeChatRequestIdRef.current) {
+          setIsChatLoading(false);
+          setCurrentToolCalls([]);
+        }
       }
     },
     [
       chatMessages,
       isAgentReady,
       initializeAgent,
+      abortActiveChatStream,
+      isAbortLikeError,
       resolveFilePath,
       findFileNodeId,
       addCodeReference,
@@ -1012,17 +1068,16 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
 
   const stopChatResponse = useCallback(() => {
     if (isChatLoading) {
-      // Agent streaming will be interrupted by the AbortController in sendChatMessage
-      setIsChatLoading(false);
-      setCurrentToolCalls([]);
+      abortActiveChatStream();
     }
-  }, [isChatLoading]);
+  }, [abortActiveChatStream, isChatLoading]);
 
   const clearChat = useCallback(() => {
+    abortActiveChatStream();
     setChatMessages([]);
     setCurrentToolCalls([]);
     setAgentError(null);
-  }, []);
+  }, [abortActiveChatStream]);
 
   // Switch to a different repo on the connected server
   const switchRepo = useCallback(
@@ -1037,6 +1092,7 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
       });
       setViewMode('loading');
       setIsAgentReady(false);
+      abortActiveChatStream();
 
       // Clear stale graph state from previous repo (highlights, selections, blast radius)
       // Without this, sigma reducers dim ALL nodes/edges because old node IDs don't match
@@ -1169,6 +1225,7 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
       setCodePanelOpen,
       setCodeReferenceFocus,
       setChatMessages,
+      abortActiveChatStream,
     ],
   );
 

@@ -1,0 +1,31 @@
+steps:
+  - id: build-web-assets
+    name: node:22-trixie
+    entrypoint: /bin/bash
+    args:
+      - -ceu
+      - |
+        npm install --prefix gitnexus-shared --include=dev --no-audit --no-fund
+        npm run --prefix gitnexus-shared build
+        npm install --prefix gitnexus-web --include=dev --no-audit --no-fund
+        npm run --prefix gitnexus-web build
+        rm -rf gitnexus/web
+        cp -R gitnexus-web/dist gitnexus/web
+
+  - id: build-web-hotfix
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --build-arg
+      - BASE_IMAGE=${_BASE_IMAGE}
+      - -f
+      - deploy/vurvey-gitnexus/Dockerfile.web-hotfix
+      - -t
+      - ${_IMAGE}
+      - .
+
+substitutions:
+  _BASE_IMAGE: us-central1-docker.pkg.dev/vurvey-development/gitnexus/gitnexus-staging:latest
+
+images:
+  - ${_IMAGE}
