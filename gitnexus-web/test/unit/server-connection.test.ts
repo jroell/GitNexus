@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fetchGraph, normalizeServerUrl, setBackendUrl } from '../../src/services/backend-client';
+import {
+  connectToServer,
+  fetchGraph,
+  normalizeServerUrl,
+  setBackendUrl,
+} from '../../src/services/backend-client';
+import type { GraphCacheProvider } from '../../src/services/graph-cache';
 
 describe('normalizeServerUrl', () => {
   it('adds http:// to localhost', () => {
@@ -34,6 +40,7 @@ describe('normalizeServerUrl', () => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe('fetchGraph', () => {
@@ -163,5 +170,125 @@ describe('fetchGraph', () => {
     await expect(fetchGraph('big-repo')).rejects.toMatchObject({
       message: 'stream failed',
     });
+  });
+});
+
+describe('connectToServer graph cache', () => {
+  it('uses a cached graph when repo metadata matches', async () => {
+    const cachedGraph = {
+      nodes: [
+        {
+          id: 'File:src/app.ts',
+          label: 'File' as const,
+          properties: { name: 'app.ts', filePath: 'src/app.ts' },
+        },
+      ],
+      relationships: [],
+    };
+    const cache: GraphCacheProvider = {
+      read: vi.fn().mockResolvedValue(cachedGraph),
+      write: vi.fn(),
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          name: 'big-repo',
+          path: '/repo',
+          indexedAt: '2026-05-07T12:00:00.000Z',
+          lastCommit: 'abc123',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const progress = vi.fn();
+    const result = await connectToServer('localhost:4747', progress, undefined, 'big-repo', {
+      cache,
+    });
+
+    expect(result.fromCache).toBe(true);
+    expect(result.nodes).toEqual(cachedGraph.nodes);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://localhost:4747/api/repo?repo=big-repo',
+      expect.any(Object),
+    );
+    expect(cache.read).toHaveBeenCalledWith({
+      baseUrl: 'http://localhost:4747',
+      repoName: 'big-repo',
+      indexedAt: '2026-05-07T12:00:00.000Z',
+      lastCommit: 'abc123',
+    });
+    expect(cache.write).not.toHaveBeenCalled();
+    expect(progress).toHaveBeenCalledWith('cache-hit', 0, null);
+  });
+
+  it('downloads and stores the graph on a cache miss', async () => {
+    const cache: GraphCacheProvider = {
+      read: vi.fn().mockResolvedValue(null),
+      write: vi.fn().mockResolvedValue(undefined),
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            name: 'big-repo',
+            path: '/repo',
+            indexedAt: '2026-05-07T12:00:00.000Z',
+            lastCommit: 'abc123',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            nodes: [
+              {
+                id: 'File:src/app.ts',
+                label: 'File',
+                properties: { name: 'app.ts', filePath: 'src/app.ts' },
+              },
+            ],
+            relationships: [],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const progress = vi.fn();
+    const result = await connectToServer('localhost:4747', progress, undefined, 'big-repo', {
+      cache,
+    });
+
+    expect(result.fromCache).toBe(false);
+    expect(result.nodes).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      'http://localhost:4747/api/graph?repo=big-repo&stream=true',
+      expect.any(Object),
+    );
+    expect(cache.write).toHaveBeenCalledWith(
+      {
+        baseUrl: 'http://localhost:4747',
+        repoName: 'big-repo',
+        indexedAt: '2026-05-07T12:00:00.000Z',
+        lastCommit: 'abc123',
+      },
+      {
+        nodes: [
+          {
+            id: 'File:src/app.ts',
+            label: 'File',
+            properties: { name: 'app.ts', filePath: 'src/app.ts' },
+          },
+        ],
+        relationships: [],
+      },
+    );
+    expect(progress).toHaveBeenCalledWith('caching', 0, null);
   });
 });

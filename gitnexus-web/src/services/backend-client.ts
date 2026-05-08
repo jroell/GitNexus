@@ -7,6 +7,12 @@
  */
 
 import type { GraphNode, GraphRelationship } from 'gitnexus-shared';
+import {
+  browserGraphCache,
+  buildGraphCacheKey,
+  type GraphCacheProvider,
+  type GraphPayload,
+} from './graph-cache';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -779,7 +785,10 @@ export interface ConnectResult {
   nodes: GraphNode[];
   relationships: GraphRelationship[];
   repoInfo: BackendRepo;
+  fromCache?: boolean;
 }
+
+export type ConnectProgressPhase = 'validating' | 'cache-hit' | 'downloading' | 'caching';
 
 /**
  * Connect to a server: validate, fetch repo info, download graph.
@@ -789,22 +798,39 @@ export interface ConnectResult {
  */
 export async function connectToServer(
   url: string,
-  onProgress?: (phase: string, downloaded: number, total: number | null) => void,
+  onProgress?: (phase: ConnectProgressPhase, downloaded: number, total: number | null) => void,
   signal?: AbortSignal,
   repoName?: string,
-  opts?: { awaitAnalysis?: boolean },
+  opts?: { awaitAnalysis?: boolean; cache?: GraphCacheProvider | false },
 ): Promise<ConnectResult> {
   const baseUrl = normalizeServerUrl(url);
   setBackendUrl(baseUrl);
 
   onProgress?.('validating', 0, null);
-  const repoInfo = await fetchRepoInfo(repoName, { awaitAnalysis: opts?.awaitAnalysis });
+  const repoInfo = await fetchRepoInfo(repoName, {
+    awaitAnalysis: opts?.awaitAnalysis,
+  });
+  const cache = opts?.cache === false ? null : (opts?.cache ?? browserGraphCache);
+  const cacheKey = buildGraphCacheKey(baseUrl, repoInfo);
+
+  if (cache) {
+    const cachedGraph = await cache.read(cacheKey);
+    if (cachedGraph) {
+      onProgress?.('cache-hit', 0, null);
+      return { ...cachedGraph, repoInfo, fromCache: true };
+    }
+  }
 
   onProgress?.('downloading', 0, null);
-  const { nodes, relationships } = await fetchGraph(repoName, {
+  const graph: GraphPayload = await fetchGraph(repoName, {
     signal,
     onProgress: (downloaded, total) => onProgress?.('downloading', downloaded, total),
   });
 
-  return { nodes, relationships, repoInfo };
+  if (cache) {
+    onProgress?.('caching', 0, null);
+    await cache.write(cacheKey, graph);
+  }
+
+  return { ...graph, repoInfo, fromCache: false };
 }

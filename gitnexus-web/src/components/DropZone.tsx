@@ -205,12 +205,14 @@ export const DropZone = ({ onServerConnect }: DropZoneProps) => {
           (p, downloaded, total) => {
             if (p === 'validating') {
               setLoadingMessage('Validating server...');
+            } else if (p === 'cache-hit') {
+              setLoadingMessage('Loading graph from local cache...');
             } else if (p === 'downloading') {
               const pct = total ? Math.round((downloaded / total) * 100) : null;
               const mb = (downloaded / (1024 * 1024)).toFixed(1);
               setLoadingMessage(pct ? `Downloading graph... ${pct}%` : `Downloading... ${mb} MB`);
-            } else if (p === 'extracting') {
-              setLoadingMessage('Processing graph...');
+            } else if (p === 'caching') {
+              setLoadingMessage('Caching graph locally...');
             }
           },
           abortController.signal,

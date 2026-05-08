@@ -86,7 +86,9 @@ export const knowledgeGraphToGraphology = (
   communityMemberships?: Map<string, number>,
 ): Graph<SigmaNodeAttributes, SigmaEdgeAttributes> => {
   const graph = new Graph<SigmaNodeAttributes, SigmaEdgeAttributes>();
-  const nodeCount = knowledgeGraph.nodes.length;
+  const nodes = knowledgeGraph.nodes;
+  const relationships = knowledgeGraph.relationships;
+  const nodeCount = nodes.length;
 
   // Build parent-child map from hierarchy relationships
   // CONTAINS: Folder -> File
@@ -99,7 +101,7 @@ export const knowledgeGraphToGraphology = (
 
   const hierarchyRelations = new Set(['CONTAINS', 'DEFINES', 'IMPORTS']);
 
-  knowledgeGraph.relationships.forEach((rel) => {
+  relationships.forEach((rel) => {
     // These relationships represent parent-child hierarchy for positioning
     if (hierarchyRelations.has(rel.type)) {
       // source CONTAINS/DEFINES/IMPORTS target, so source is parent
@@ -112,11 +114,15 @@ export const knowledgeGraphToGraphology = (
   });
 
   // Create node lookup
-  const nodeMap = new Map(knowledgeGraph.nodes.map((n) => [n.id, n]));
+  const nodeMap = new Map<string, (typeof nodes)[number]>();
+  nodes.forEach((node) => {
+    nodeMap.set(node.id, node);
+  });
 
   // Separate structural nodes (folders, packages) from content nodes
   const structuralTypes = new Set(['Project', 'Package', 'Module', 'Folder']);
-  const structuralNodes = knowledgeGraph.nodes.filter((n) => structuralTypes.has(n.label));
+  const structuralNodes = nodes.filter((n) => structuralTypes.has(n.label));
+  const symbolTypes = new Set(['Function', 'Class', 'Method', 'Interface']);
 
   // Much wider spread for structural nodes - this is the key!
   const structuralSpread = Math.sqrt(nodeCount) * 40;
@@ -196,7 +202,6 @@ export const knowledgeGraphToGraphology = (
 
     // Check if this is a symbol node with a community assignment
     const communityIndex = communityMemberships?.get(nodeId);
-    const symbolTypes = new Set(['Function', 'Class', 'Method', 'Interface']);
     const clusterCenter = communityIndex !== undefined ? clusterCenters.get(communityIndex) : null;
 
     if (clusterCenter && symbolTypes.has(node.label)) {
@@ -252,9 +257,10 @@ export const knowledgeGraphToGraphology = (
   // BFS from structural nodes - this ensures parent is ALWAYS positioned before child
   const queue: string[] = [...structuralNodes.map((n) => n.id)];
   const visited = new Set<string>(queue);
+  let queueIndex = 0;
 
-  while (queue.length > 0) {
-    const currentId = queue.shift()!;
+  while (queueIndex < queue.length) {
+    const currentId = queue[queueIndex++];
 
     // Get children of current node and add them
     const children = parentToChildren.get(currentId) || [];
@@ -268,7 +274,7 @@ export const knowledgeGraphToGraphology = (
   }
 
   // Add any orphan nodes that weren't reached (no parent relationship)
-  knowledgeGraph.nodes.forEach((node) => {
+  nodes.forEach((node) => {
     if (!graph.hasNode(node.id)) {
       addNodeWithPosition(node.id);
     }
@@ -297,10 +303,13 @@ export const knowledgeGraphToGraphology = (
     IMPLEMENTS: { color: '#be185d', sizeMultiplier: 0.9 }, // Pink - interface implementation
   };
 
-  knowledgeGraph.relationships.forEach((rel) => {
+  relationships.forEach((rel) => {
     if (graph.hasNode(rel.sourceId) && graph.hasNode(rel.targetId)) {
       if (!graph.hasEdge(rel.sourceId, rel.targetId)) {
-        const style = EDGE_STYLES[rel.type] || { color: '#4a4a5a', sizeMultiplier: 0.5 };
+        const style = EDGE_STYLES[rel.type] || {
+          color: '#4a4a5a',
+          sizeMultiplier: 0.5,
+        };
         const curvature = 0.12 + Math.random() * 0.08;
 
         graph.addEdge(rel.sourceId, rel.targetId, {
@@ -340,9 +349,10 @@ export const getNodesWithinHops = (
 ): Set<string> => {
   const visited = new Set<string>();
   const queue: { nodeId: string; depth: number }[] = [{ nodeId: startNodeId, depth: 0 }];
+  let queueIndex = 0;
 
-  while (queue.length > 0) {
-    const { nodeId, depth } = queue.shift()!;
+  while (queueIndex < queue.length) {
+    const { nodeId, depth } = queue[queueIndex++];
 
     if (visited.has(nodeId)) continue;
     visited.add(nodeId);

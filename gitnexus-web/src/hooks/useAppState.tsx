@@ -1120,6 +1120,13 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
                 message: 'Switching repository...',
                 detail: 'Validating',
               });
+            } else if (phase === 'cache-hit') {
+              setProgress({
+                phase: 'extracting',
+                percent: 96,
+                message: 'Loading repository...',
+                detail: 'Using local cache',
+              });
             } else if (phase === 'downloading') {
               const pct = total ? Math.round((downloaded / total) * 90) + 5 : 50;
               const mb = (downloaded / (1024 * 1024)).toFixed(1);
@@ -1129,12 +1136,12 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
                 message: 'Downloading graph...',
                 detail: `${mb} MB downloaded`,
               });
-            } else if (phase === 'extracting') {
+            } else if (phase === 'caching') {
               setProgress({
                 phase: 'extracting',
                 percent: 97,
-                message: 'Processing...',
-                detail: 'Extracting file contents',
+                message: 'Caching graph...',
+                detail: 'Saving for faster reloads',
               });
             }
           },
