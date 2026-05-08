@@ -76,27 +76,27 @@ const writeSettings = (storage: Storage, settings: LLMSettings): void => {
 };
 
 /**
- * Load settings from sessionStorage (migrates legacy localStorage once).
+ * Load settings from localStorage (migrates sessionStorage fallback once).
  */
 export const loadSettings = (): LLMSettings => {
   try {
-    const sessionData = typeof sessionStorage !== 'undefined' ? readSettings(sessionStorage) : null;
-    if (sessionData) {
-      return mergeWithDefaults(sessionData);
+    const localData = typeof localStorage !== 'undefined' ? readSettings(localStorage) : null;
+    if (localData) {
+      return mergeWithDefaults(localData);
     }
 
-    const legacyData = typeof localStorage !== 'undefined' ? readSettings(localStorage) : null;
-    if (legacyData) {
-      const merged = mergeWithDefaults(legacyData);
+    const sessionData = typeof sessionStorage !== 'undefined' ? readSettings(sessionStorage) : null;
+    if (sessionData) {
+      const merged = mergeWithDefaults(sessionData);
       try {
-        if (typeof sessionStorage !== 'undefined') {
-          writeSettings(sessionStorage, merged);
-        }
         if (typeof localStorage !== 'undefined') {
-          localStorage.removeItem(STORAGE_KEY);
+          writeSettings(localStorage, merged);
+        }
+        if (typeof sessionStorage !== 'undefined') {
+          sessionStorage.removeItem(STORAGE_KEY);
         }
       } catch (error) {
-        console.warn('Failed to migrate legacy LLM settings to sessionStorage:', error);
+        console.warn('Failed to migrate LLM settings to localStorage:', error);
       }
       return merged;
     }
@@ -109,12 +109,12 @@ export const loadSettings = (): LLMSettings => {
 };
 
 /**
- * Save settings to sessionStorage
+ * Save settings to localStorage
  */
 export const saveSettings = (settings: LLMSettings): void => {
   try {
-    if (typeof sessionStorage !== 'undefined') {
-      writeSettings(sessionStorage, settings);
+    if (typeof localStorage !== 'undefined') {
+      writeSettings(localStorage, settings);
     }
   } catch (error) {
     console.error('Failed to save LLM settings:', error);
@@ -267,20 +267,30 @@ type ProviderBuilder = (settings: LLMSettings) => ProviderConfig | null;
 
 const providerBuilders: Record<LLMProvider, ProviderBuilder> = {
   openai: (settings) => {
-    if (!settings.openai?.apiKey) return null;
-    return { provider: 'openai', ...settings.openai } as OpenAIConfig;
+    const apiKey = settings.openai?.apiKey?.trim();
+    if (!apiKey) return null;
+    return { provider: 'openai', ...settings.openai, apiKey } as OpenAIConfig;
   },
   'azure-openai': (settings) => {
-    if (!settings.azureOpenAI?.apiKey || !settings.azureOpenAI?.endpoint) return null;
-    return { provider: 'azure-openai', ...settings.azureOpenAI } as AzureOpenAIConfig;
+    const apiKey = settings.azureOpenAI?.apiKey?.trim();
+    const endpoint = settings.azureOpenAI?.endpoint?.trim();
+    if (!apiKey || !endpoint) return null;
+    return {
+      provider: 'azure-openai',
+      ...settings.azureOpenAI,
+      apiKey,
+      endpoint,
+    } as AzureOpenAIConfig;
   },
   gemini: (settings) => {
-    if (!settings.gemini?.apiKey) return null;
-    return { provider: 'gemini', ...settings.gemini } as GeminiConfig;
+    const apiKey = settings.gemini?.apiKey?.trim();
+    if (!apiKey) return null;
+    return { provider: 'gemini', ...settings.gemini, apiKey } as GeminiConfig;
   },
   anthropic: (settings) => {
-    if (!settings.anthropic?.apiKey) return null;
-    return { provider: 'anthropic', ...settings.anthropic } as AnthropicConfig;
+    const apiKey = settings.anthropic?.apiKey?.trim();
+    if (!apiKey) return null;
+    return { provider: 'anthropic', ...settings.anthropic, apiKey } as AnthropicConfig;
   },
   ollama: (settings) => {
     return {
@@ -301,18 +311,20 @@ const providerBuilders: Record<LLMProvider, ProviderBuilder> = {
     } as OpenRouterConfig;
   },
   minimax: (settings) => {
-    if (!settings.minimax?.apiKey) return null;
-    return { provider: 'minimax', ...settings.minimax } as MiniMaxConfig;
+    const apiKey = settings.minimax?.apiKey?.trim();
+    if (!apiKey) return null;
+    return { provider: 'minimax', ...settings.minimax, apiKey } as MiniMaxConfig;
   },
   glm: (settings) => {
-    if (!settings.glm?.apiKey) return null;
+    const apiKey = settings.glm?.apiKey?.trim();
+    if (!apiKey) return null;
     return {
       provider: 'glm',
-      apiKey: settings.glm.apiKey,
-      model: settings.glm.model || 'GLM-5',
-      baseUrl: settings.glm.baseUrl || 'https://api.z.ai/api/coding/paas/v4',
-      temperature: settings.glm.temperature,
-      maxTokens: settings.glm.maxTokens,
+      apiKey,
+      model: settings.glm?.model || 'GLM-5',
+      baseUrl: settings.glm?.baseUrl || 'https://api.z.ai/api/coding/paas/v4',
+      temperature: settings.glm?.temperature,
+      maxTokens: settings.glm?.maxTokens,
     } as GLMConfig;
   },
 };

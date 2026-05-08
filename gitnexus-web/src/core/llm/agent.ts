@@ -174,6 +174,7 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
     case 'anthropic': {
       const anthropicConfig = config as AnthropicConfig;
       return new ChatAnthropic({
+        apiKey: anthropicConfig.apiKey,
         anthropicApiKey: anthropicConfig.apiKey,
         model: anthropicConfig.model,
         temperature: anthropicConfig.temperature ?? 0.1,
@@ -235,6 +236,7 @@ export const createChatModel = (config: ProviderConfig): BaseChatModel => {
       }
 
       return new ChatAnthropic({
+        apiKey: minimaxConfig.apiKey,
         anthropicApiKey: minimaxConfig.apiKey,
         model: minimaxConfig.model,
         temperature: minimaxConfig.temperature ?? 0.1,
